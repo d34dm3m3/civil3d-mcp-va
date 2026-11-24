@@ -35,10 +35,13 @@ import { DRAWING_RUNTIME_DOMAIN_DEFINITION } from "./domains/drawingRuntimeDomai
 import { COORDINATE_SYSTEM_DOMAIN_DEFINITION } from "./domains/coordinateSystemDomain.js";
 import { JOB_DOMAIN_DEFINITION } from "./domains/jobDomain.js";
 import { PLUGIN_DOMAIN_DEFINITION } from "./domains/pluginDomain.js";
+import { INVOKE_DOMAIN_DEFINITION } from "./domains/invokeDomain.js";
 import { DOCS_DOMAIN_DEFINITION } from "./domains/docsDomain.js";
 import { WORKFLOW_DOMAIN_DEFINITION } from "./domains/workflowDomain.js";
 import type { ToolCatalogEntry } from "./toolMetadata.js";
+import { withRawAction } from "./rawAction.js";
 
+// C64: every domain tool gets action "raw" (plugin method + params, behind approval), see rawAction.ts
 export const MIGRATED_DOMAIN_DEFINITIONS = [
   ALIGNMENT_DOMAIN_DEFINITION,
   SURFACE_DOMAIN_DEFINITION,
@@ -70,7 +73,8 @@ export const MIGRATED_DOMAIN_DEFINITIONS = [
   WORKFLOW_DOMAIN_DEFINITION,
   PLUGIN_DOMAIN_DEFINITION,
   DOCS_DOMAIN_DEFINITION,
-];
+  INVOKE_DOMAIN_DEFINITION,   // C154: every plugin command via the plugin's own table
+].map(withRawAction);
 
 export const GENERATED_TOOL_CATALOG_ENTRIES: ToolCatalogEntry[] = MIGRATED_DOMAIN_DEFINITIONS.flatMap(
   (definition) => buildDomainToolCatalogEntries(definition),

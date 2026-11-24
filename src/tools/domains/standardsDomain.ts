@@ -19,6 +19,7 @@ const StyleObjectTypeSchema = z.enum([
   "point",
   "section",
   "assembly",
+  "code_set",
 ]);
 
 const GenericStandardsResponseSchema = z.object({}).passthrough();

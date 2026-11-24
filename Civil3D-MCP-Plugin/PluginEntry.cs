@@ -13,8 +13,15 @@ public sealed class PluginEntry : IExtensionApplication
   {
     try
     {
+      // C93: watchdog, application-context queue and document snapshot first, so they run even when the listener
+      // cannot start (port in use; C3DMCPSTART later) and before the first request can arrive.
+      IdleWatchdog.Initialize();
+      ApplicationContextQueue.Initialize();              // idle handler attached once, on the main thread
+      DocumentSnapshot.Start();
       PluginRuntime.StartServer();
-      PluginLog.Info("PluginEntry", $"Civil3D MCP plugin initialized on port {PluginRuntime.Port}. Log file: {PluginLog.LogFilePath}");
+      SelectionTracker.Start();
+      if (AppContext.GetData(PluginReloadCommands.RequestKey) != null) DeferredCommand.RegisterOwnCommand();   // C70b
+      PluginLog.Info("PluginEntry", $"Civil3D MCP plugin initialized on port {PluginRuntime.Port} (build {PluginReloadCommands.Build()}). Log file: {PluginLog.LogFilePath}");
       WriteMessage("Civil3D MCP plugin initialized.");
     }
     catch (System.Exception ex)
@@ -24,12 +31,22 @@ public sealed class PluginEntry : IExtensionApplication
     }
   }
 
-  public void Terminate()
+  public void Terminate() => Shutdown();
+
+  /// <summary>Stops the listener and detaches everything hooked into Civil 3D, so a newer build can be loaded beside
+  /// this one by the loader without restarting Civil 3D (C70). Also used when Civil 3D closes.</summary>
+  public void Shutdown()
   {
     try
     {
       PluginRuntime.StopServer();
-      PluginLog.Info("PluginEntry", "Civil3D MCP plugin terminated cleanly.");
+      SelectionTracker.Stop();
+      DeferredCommand.Shutdown();
+      DeferredCommand.UnregisterOwnCommand();
+      ApplicationContextQueue.Shutdown();                // C93
+      DocumentSnapshot.Stop();
+      IdleWatchdog.Shutdown();
+      PluginLog.Info("PluginEntry", $"Civil3D MCP plugin terminated cleanly (build {PluginReloadCommands.Build()}).");
     }
     catch (System.Exception ex)
     {

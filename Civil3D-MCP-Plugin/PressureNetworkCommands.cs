@@ -514,11 +514,16 @@ public static class PressureNetworkCommands
       ["name"] = CivilObjectUtils.GetName(pipe) ?? string.Empty,
       ["handle"] = CivilObjectUtils.GetHandle(pipe),
       ["diameter"] = GetAnyDouble(pipe, "InnerDiameter", "InnerDiameterOrWidth", "Diameter"),
-      ["length"] = GetAnyDouble(pipe, "Length3D", "Length2D", "Length"),
+      // C164: a pressure pipe's lengths are Length3D/2DCenterToCenter (length was always null, qtyPressureNetworkLengths failed)
+      ["length"] = GetAnyDouble(pipe, "Length3DCenterToCenter", "Length3D", "Length2D", "Length"),
+      ["length2D"] = GetAnyDouble(pipe, "Length2DCenterToCenter", "Length2D"),
+      ["outerDiameter"] = GetAnyDouble(pipe, "OuterDiameter"),
+      ["nominalDiameter"] = GetAnyDouble(pipe, "NominalDiameter"),
       ["material"] = GetAnyString(pipe, "Material", "PartFamilyName", "PartDescription") ?? string.Empty,
       ["startPoint"] = sp.HasValue ? new Dictionary<string, object?> { ["x"] = sp.Value.X, ["y"] = sp.Value.Y, ["z"] = sp.Value.Z } : null,
       ["endPoint"] = ep.HasValue ? new Dictionary<string, object?> { ["x"] = ep.Value.X, ["y"] = ep.Value.Y, ["z"] = ep.Value.Z } : null,
-      ["coverDepth"] = GetAnyDouble(pipe, "CoverDepth", "Cover", "MinCover"),
+      ["coverDepth"] = GetAnyDouble(pipe, "MinimumCover", "CoverDepth", "Cover", "MinCover"),
+      ["maximumCover"] = GetAnyDouble(pipe, "MaximumCover"),
     };
   }
 
@@ -617,14 +622,18 @@ public static class PressureNetworkCommands
 
   private static ObjectId FindPressurePartsListId(object civilDoc, Transaction transaction, string partsListName)
   {
+    var names = new List<string>();
     foreach (ObjectId objectId in ((CivilDocument)civilDoc).Styles.GetPressurePartLists())
     {
       var list = CivilObjectUtils.GetRequiredObject<PressurePartList>(transaction, objectId, OpenMode.ForRead);
       if (string.Equals(list.Name, partsListName, StringComparison.OrdinalIgnoreCase))
         return objectId;
+      names.Add(list.Name);
     }
 
-    throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Pressure parts list '{partsListName}' was not found.");
+    // C164: the answer names the pressure parts lists there are (no command lists them)
+    throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND",
+      $"Pressure parts list '{partsListName}' was not found. Pressure parts lists: {(names.Count == 0 ? "none" : string.Join(", ", names))}.");
   }
 
   private static PressurePartSize FindPressurePart(
@@ -644,18 +653,23 @@ public static class PressureNetworkCommands
           return part;
       }
     }
-    throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Exact pressure part '{partName}' was not found in parts list '{partsList.Name}'.");
+    // C164: the answer names the parts of the asked types (descriptions are the part names to give)
+    var available = partTypes.SelectMany(t => partsList.GetParts(t).Cast<PressurePartSize>().Where(p => p.IsValid).Select(p => p.Description)).Distinct().Take(40).ToList();
+    throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND",
+      $"Exact pressure part '{partName}' was not found in parts list '{partsList.Name}'. Parts ({string.Join("/", partTypes)}): {(available.Count == 0 ? "none" : string.Join("; ", available))}.");
   }
 
   private static IEnumerable<ObjectId> GetChildObjectIds(object owner, params string[] memberNames)
   {
+    // C164: the first member that gives ids is the answer; reading every member counted each pipe and fitting twice
+    // (GetPipeIds and Pipes: pipeCount 4 for two pipes).
     foreach (var memberName in memberNames)
     {
       var value = CivilObjectUtils.InvokeMethod(owner, memberName) ?? GetNamedMember(owner, memberName);
-      foreach (var id in ToObjectIdsFlexible(value))
-      {
-        if (id != ObjectId.Null) yield return id;
-      }
+      var ids = ToObjectIdsFlexible(value).Where(id => id != ObjectId.Null).Distinct().ToList();
+      if (ids.Count == 0) continue;
+      foreach (var id in ids) yield return id;
+      yield break;
     }
   }
 

@@ -76,8 +76,19 @@ public static class LabelCommands
 
       if (string.Equals(objectType, "alignment", StringComparison.OrdinalIgnoreCase) && string.Equals(labelType, "label_set", StringComparison.OrdinalIgnoreCase))
       {
-        var labelSetId = LookupUtils.GetAlignmentLabelSetId(civilDoc, transaction, labelStyle);
-        ApplyObjectIdProperty(target, labelSetId, "LabelSetId");
+        // C97 (2026-10-10): an alignment has no LabelSetId property (the reflection set failed); its label set is
+        // imported with Alignment.ImportLabelSet, which puts the set's labels on the alignment (whether earlier labels
+        // go is to be seen live). The set is looked up by its exact name (an unknown name lists the sets), never the
+        // first one by default. Use case: the template's default set (stations every 100 m) shows "R=0" at every bend of a VA
+        // line without curves; a set without radius labels is to be tried instead.
+        if (string.IsNullOrWhiteSpace(labelStyle))
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "label_set needs labelStyle: the name of the alignment label set. Nothing was changed.");
+        if (target is not Autodesk.Civil.DatabaseServices.Alignment found)
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"'{objectName}' is not an alignment. Nothing was changed.");
+        var labelSetId = LookupUtils.GetStyleIdStrict(civilDoc.Styles.LabelSetStyles.AlignmentLabelSetStyles, transaction, labelStyle, "Alignment label set");
+        // Review: the alignment lookup opens it for read; importing a label set changes it.
+        var alignment = (Autodesk.Civil.DatabaseServices.Alignment)transaction.GetObject(found.ObjectId, OpenMode.ForWrite);
+        alignment.ImportLabelSet(labelSetId);
         return new Dictionary<string, object?>
         {
           ["objectType"] = objectType,
@@ -85,6 +96,7 @@ public static class LabelCommands
           ["labelType"] = labelType,
           ["labelStyle"] = ResolveObjectName(transaction, labelSetId),
           ["applied"] = true,
+          ["note"] = "Imported with Alignment.ImportLabelSet; check with label_list whether the alignment's earlier labels were replaced.",
         };
       }
 
@@ -306,6 +318,22 @@ public static class LabelCommands
 
   private static IEnumerable<ObjectId> GetLabelStyleCollection(object civilDoc, string objectType)
   {
+    // Pipe and structure label styles live under Styles.LabelStyles; the reflection walk below looked for
+    // them on Styles and always came back empty (2026-10-06).
+    if (civilDoc is Autodesk.Civil.ApplicationServices.CivilDocument typed)
+    {
+      var labelStyles = typed.Styles.LabelStyles;
+      Autodesk.Civil.DatabaseServices.Styles.LabelStyleCollection? known = objectType.ToLowerInvariant() switch
+      {
+        "pipe" => labelStyles.PipeLabelStyles.PlanProfileLabelStyles,
+        "pipe_crossing" => labelStyles.PipeLabelStyles.CrossProfileLabelStyles,
+        "pipe_section" => labelStyles.PipeLabelStyles.CrossSectionLabelStyles,
+        "structure" => labelStyles.StructureLabelStyles.LabelStyles,
+        _ => null,
+      };
+      if (known != null) return known.Cast<ObjectId>().Where(id => !id.IsNull).ToList();
+    }
+
     var styles = GetNamedMemberValue(civilDoc, "Styles") ?? throw new JsonRpcDispatchException("CIVIL3D.TRANSACTION_FAILED", "Civil 3D styles collection is not available.");
     var labelSetStyles = GetNamedMemberValue(styles, "LabelSetStyles");
 

@@ -65,7 +65,7 @@ internal static class Civil3DCompatibility
       return null;
     }
 
-    var property = ResolveProperty(target.GetType(), propertyName, isStatic: false);
+    var property = ResolveAccessor(target.GetType(), propertyName, forWrite: false);
     if (property == null)
     {
       return null;
@@ -127,7 +127,7 @@ internal static class Civil3DCompatibility
       return false;
     }
 
-    var property = ResolveProperty(target.GetType(), propertyName, isStatic: false);
+    var property = ResolveAccessor(target.GetType(), propertyName, forWrite: true);
     if (property?.CanWrite != true)
     {
       return false;
@@ -149,6 +149,159 @@ internal static class Civil3DCompatibility
       return false;
     }
   }
+
+  /// <summary>Public instance properties whose type is a Civil 3D API class (the style collections and their
+  /// groups under CivilDocument.Styles); C78 walks them to list the style collections of a drawing.</summary>
+  public static IReadOnlyList<string> GetCivilReferencePropertyNames(object target) =>
+    target.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
+      .Where(p => p.CanRead && p.GetIndexParameters().Length == 0 && !p.PropertyType.IsValueType && p.PropertyType != typeof(string)
+        && (p.PropertyType.Namespace ?? "").StartsWith("Autodesk.Civil", StringComparison.Ordinal))
+      .Select(p => p.Name)
+      .ToList();
+
+  /// <summary>A public instance property by name, ignoring case (style collection paths typed by hand, C78).
+  /// Found is false when there is no such property; exceptions from the getter propagate.</summary>
+  public static (bool Found, object? Value) GetPropertyIgnoreCase(object target, string propertyName)
+  {
+    var property = target.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+    if (property == null || property.GetIndexParameters().Length > 0) return (false, null);
+    return (true, property.GetValue(target));
+  }
+
+  /// <summary>Public, non-abstract, non-generic top-level classes of baseType's assembly that derive from baseType.
+  /// C91: the Civil settings types SettingsRoot.GetSettings&lt;T&gt; takes (T : SettingsAmbient, about 200 in Civil 3D
+  /// 2026), listed from the host's assembly rather than hard-coded, so a new release's types are found too.</summary>
+  public static IReadOnlyList<Type> GetPublicSubclasses(Type baseType) =>
+    SubclassCache.GetOrAdd(baseType, static type =>
+    {
+      Type[] exported;
+      try
+      {
+        exported = type.Assembly.GetExportedTypes();
+      }
+      catch (ReflectionTypeLoadException exception)
+      {
+        exported = exception.Types.Where(t => t != null).Cast<Type>().ToArray();
+      }
+
+      return exported
+        .Where(t => t.IsClass && !t.IsAbstract && !t.IsGenericTypeDefinition && !t.IsNested && t.IsSubclassOf(type))
+        .OrderBy(t => t.Name, StringComparer.Ordinal)
+        .ToArray();
+    });
+
+  private static readonly ConcurrentDictionary<Type, Type[]> SubclassCache = new();
+
+  /// <summary>Calls a public parameterless generic instance method with one type argument chosen at run time.
+  /// C91: SettingsRoot.GetSettings&lt;T&gt;() for the settings type a caller names. An exception thrown by the method
+  /// itself propagates unwrapped (not as TargetInvocationException); a missing method is MissingMethodException.</summary>
+  public static object? InvokeGenericMethod(object target, string methodName, Type typeArgument)
+  {
+    var method = target.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+      .FirstOrDefault(m => m.Name == methodName && m.IsGenericMethodDefinition && m.GetGenericArguments().Length == 1 && m.GetParameters().Length == 0)
+      ?? throw new MissingMethodException(target.GetType().Name, methodName);
+    try
+    {
+      return method.MakeGenericMethod(typeArgument).Invoke(target, null);
+    }
+    catch (TargetInvocationException exception) when (exception.InnerException != null)
+    {
+      System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
+      throw;
+    }
+  }
+
+  /// <summary>C98e: one display component of a Civil style (Display tab): its view direction (Plan, Profile, Section,
+  /// Model), its name, and a getter that returns the component's display style for a style object.</summary>
+  internal sealed record DisplayComponentGetter(string View, string Component, Func<object, object?> Get);
+
+  private static readonly string[] DisplayViews = { "Plan", "Profile", "Section", "Model" };
+  private static readonly System.Text.RegularExpressions.Regex DisplayMethodName =
+    new(@"^Get(?<component>[A-Za-z0-9]*?)DisplayStyle(?<view>Plan|Profile|Section|Model)$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+  private static readonly ConcurrentDictionary<(Type Style, Type Component), DisplayComponentGetter[]> DisplayGetterCache = new();
+
+  /// <summary>C98e: the display components of a style type, from its public instance methods that return componentType
+  /// and are named Get{Component}DisplayStyle{View}: with one enum parameter every enum value is a component
+  /// (ProfileStyle.GetDisplayStyleProfile(ProfileDisplayStyleProfileType): Line, Curve, LineExtension, …); without
+  /// parameters the component is the name part, or "Default" (ProfileStyle.GetChain3DDisplayStyleModel: Chain3D,
+  /// AlignmentStyle.GetDisplayStyleSection: Default). Views in the order Plan, Profile, Section, Model; the enum
+  /// components in enum order before the named ones. An exception of the getter itself propagates unwrapped.</summary>
+  public static IReadOnlyList<DisplayComponentGetter> GetDisplayComponentGetters(Type styleType, Type componentType) =>
+    DisplayGetterCache.GetOrAdd((styleType, componentType), static key =>
+    {
+      var found = new List<(int View, int Group, int Order, DisplayComponentGetter Getter)>();
+      foreach (var method in key.Style.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+      {
+        if (method.ReturnType != key.Component || method.IsGenericMethodDefinition) continue;
+        var match = DisplayMethodName.Match(method.Name);
+        if (!match.Success) continue;
+        var view = match.Groups["view"].Value;
+        var prefix = match.Groups["component"].Value;
+        var viewIndex = Array.IndexOf(DisplayViews, view);
+        var parameters = method.GetParameters();
+        if (parameters.Length == 0)
+        {
+          var name = prefix.Length > 0 ? prefix : "Default";
+          found.Add((viewIndex, 1, 0, new DisplayComponentGetter(view, name, target => InvokeUnwrapped(method, target, null))));
+        }
+        else if (parameters.Length == 1 && parameters[0].ParameterType.IsEnum)
+        {
+          var enumType = parameters[0].ParameterType;
+          var order = 0;
+          foreach (var value in Enum.GetValues(enumType).Cast<object>().Distinct())
+          {
+            var name = (prefix.Length > 0 ? prefix + "." : "") + Enum.GetName(enumType, value);
+            var argument = new[] { value };
+            found.Add((viewIndex, 0, order++, new DisplayComponentGetter(view, name, target => InvokeUnwrapped(method, target, argument))));
+          }
+        }
+      }
+
+      return found
+        .OrderBy(f => f.View).ThenBy(f => f.Group).ThenBy(f => f.Order).ThenBy(f => f.Getter.Component, StringComparer.Ordinal)
+        .GroupBy(f => (f.Getter.View, f.Getter.Component.ToUpperInvariant())).Select(g => g.First().Getter)
+        .ToArray();
+    });
+
+  private static object? InvokeUnwrapped(MethodInfo method, object target, object?[]? arguments)
+  {
+    try
+    {
+      return method.Invoke(target, arguments);
+    }
+    catch (TargetInvocationException exception) when (exception.InnerException != null)
+    {
+      System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
+      throw;
+    }
+  }
+
+  /// <summary>C98e: public instance properties of propertyType with a getter and a setter whose names end with one of
+  /// the suffixes, e.g. the marker styles of a profile style (VIntersectionPointMarkerStyle) or of a feature line style
+  /// (SectionMarkerStyleId). Read and written with GetPropertyValue and TrySetProperty.</summary>
+  public static IReadOnlyList<string> GetReadWritePropertyNames(Type type, Type propertyType, params string[] suffixes) =>
+    type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+      .Where(p => p.PropertyType == propertyType && p.GetIndexParameters().Length == 0
+        && p.GetGetMethod() != null && ResolveAccessor(type, p.Name, forWrite: true) != null
+        && suffixes.Any(s => p.Name.EndsWith(s, StringComparison.Ordinal)))
+      .Select(p => p.Name)
+      .Distinct(StringComparer.Ordinal)
+      .OrderBy(n => n, StringComparer.Ordinal)
+      .ToList();
+
+  /// <summary>Simple public instance properties (string, bool, int, double, enum) with type and whether they
+  /// can be written, for generic option editing (pipe and structure style options).</summary>
+  public static IReadOnlyList<(string Name, Type Type, bool CanWrite)> GetSimplePropertyInfo(object target) =>
+    target.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
+      .Where(property => property.CanRead && property.GetIndexParameters().Length == 0)
+      .Where(property =>
+      {
+        var propertyType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+        return propertyType.IsEnum || propertyType == typeof(string) || propertyType == typeof(bool)
+          || propertyType == typeof(int) || propertyType == typeof(double);
+      })
+      .Select(property => (property.Name, property.PropertyType, property.CanWrite))
+      .ToList();
 
   public static IReadOnlyDictionary<string, object?> GetReadableScalarProperties(object target)
   {
@@ -179,6 +332,48 @@ internal static class Civil3DCompatibility
     }
 
     return values;
+  }
+
+  /// <summary>C93: a property of a COM automation object (IDispatch, e.g. the AcadDocument behind a Document), which
+  /// has no managed metadata to reflect on; null when the object or the property is not available.</summary>
+  public static object? GetComProperty(object? comObject, string propertyName)
+  {
+    if (comObject == null)
+    {
+      return null;
+    }
+
+    try
+    {
+      return comObject.GetType().InvokeMember(propertyName, BindingFlags.GetProperty, null, comObject, null);
+    }
+    catch
+    {
+      return null;
+    }
+  }
+
+  /// <summary>C97: calls a method of a COM automation object (IDispatch, e.g. AcadDocument.Save/SaveAs); the COM
+  /// error itself is thrown, not the reflection wrapper.</summary>
+  /// <summary>C149: the exception behind reflection and task wrappers (TargetInvocationException, AggregateException).</summary>
+  public static Exception UnwrapInvocation(Exception ex)
+  {
+    var root = ex;
+    while (root is TargetInvocationException or AggregateException && root.InnerException != null) root = root.InnerException;
+    return root;
+  }
+
+  public static object? InvokeComMethod(object comObject, string methodName, params object?[] arguments)
+  {
+    try
+    {
+      return comObject.GetType().InvokeMember(methodName, BindingFlags.InvokeMethod, null, comObject, arguments);
+    }
+    catch (TargetInvocationException ex) when (ex.InnerException != null)
+    {
+      System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+      throw;
+    }
   }
 
   public static object? InvokeMethod(object? target, string methodName, params object?[] arguments)
@@ -361,6 +556,34 @@ internal static class Civil3DCompatibility
     {
       var flags = BindingFlags.Public | (item.IsStatic ? BindingFlags.Static : BindingFlags.Instance);
       return new CachedProperty(item.Type.GetProperty(item.Name, flags));
+    }).Value;
+  }
+
+  // Civil 3D overrides single accessors: StyleBase.Name has only a setter over the readable
+  // Civil DBObject.Name, Part.Name only a getter. Type.GetProperty returns the most-derived
+  // declaration, which lacks the other accessor, so a reflective read returned null (C12b).
+  // Walk the hierarchy for the first non-indexed declaration that has the accessor needed;
+  // invoking a base declaration still dispatches virtually to the override.
+  private static PropertyInfo? ResolveAccessor(Type type, string propertyName, bool forWrite)
+  {
+    var key = new PropertyKey(type, (forWrite ? "set:" : "get:") + propertyName, IsStatic: false);
+    return PropertyCache.GetOrAdd(key, item =>
+    {
+      const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+      for (var current = item.Type; current != null; current = current.BaseType)
+      {
+        foreach (var property in current.GetProperties(flags))
+        {
+          if (property.Name == propertyName
+            && property.GetIndexParameters().Length == 0
+            && (forWrite ? property.CanWrite : property.CanRead))
+          {
+            return new CachedProperty(property);
+          }
+        }
+      }
+
+      return new CachedProperty(null);
     }).Value;
   }
 

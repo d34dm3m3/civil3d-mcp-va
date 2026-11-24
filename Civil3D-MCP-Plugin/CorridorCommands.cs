@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.Geometry;
 using Autodesk.Civil.ApplicationServices;
 using Autodesk.Civil.DatabaseServices;
 
@@ -35,26 +36,7 @@ public static class CorridorCommands
 
       foreach (Baseline baseline in corridor.Baselines)
       {
-        var regions = new List<Dictionary<string, object?>>();
-        foreach (BaselineRegion region in baseline.BaselineRegions)
-        {
-          regions.Add(new Dictionary<string, object?>
-          {
-            ["name"] = region.Name,
-            ["assemblyName"] = CivilObjectUtils.GetName(transaction.GetObject(region.AssemblyId, OpenMode.ForRead)) ?? string.Empty,
-            ["startStation"] = region.StartStation,
-            ["endStation"] = region.EndStation,
-            ["frequency"] = 0,
-          });
-        }
-
-        baselines.Add(new Dictionary<string, object?>
-        {
-          ["name"] = baseline.Name,
-          ["alignmentName"] = CivilObjectUtils.GetName(transaction.GetObject(baseline.AlignmentId, OpenMode.ForRead)) ?? string.Empty,
-          ["profileName"] = CivilObjectUtils.GetName(transaction.GetObject(baseline.ProfileId, OpenMode.ForRead)) ?? string.Empty,
-          ["regions"] = regions,
-        });
+        baselines.Add(ToBaselineInfo(baseline, transaction));
       }
 
       var surfaces = ReadCorridorSurfaces(corridor, transaction);
@@ -185,17 +167,78 @@ public static class CorridorCommands
     });
   }
 
+  /// <summary>Feature line codes of a corridor; with includeGeometry (C60, 2026-10-08) also each feature line's 3D
+  /// points (main baselines) per code, side by the sign of the median offset, for machine control lines such as the
+  /// trench bottom edges and daylight.</summary>
   public static Task<object?> GetCorridorFeatureLinesAsync(JsonObject? parameters)
   {
     var name = PluginRuntime.GetRequiredString(parameters, "name");
+    var includeGeometry = PluginRuntime.GetOptionalBool(parameters, "includeGeometry") ?? false;
+    var codes = (PluginRuntime.GetParameter(parameters, "codes") as JsonArray)?.Select(n => n?.GetValue<string>()).OfType<string>()
+      .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var decimals = PluginRuntime.GetOptionalInt(parameters, "decimals") ?? 3;
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var corridor = CivilObjectUtils.FindCorridorByName(civilDoc, transaction, name, OpenMode.ForRead);
-      return new Dictionary<string, object?>
+      var result = new Dictionary<string, object?>
       {
         ["corridorName"] = corridor.Name,
         ["featureLines"] = ReadCorridorFeatureLines(corridor),
       };
+      if (!includeGeometry)
+        return result;
+
+      var lines = new List<Dictionary<string, object?>>();
+      var diagnostics = new List<Dictionary<string, object?>>();
+      foreach (Baseline baseline in corridor.Baselines)
+      {
+        var map = baseline.MainBaselineFeatureLines.FeatureLineCollectionMap;
+        // per code through CodeNames() and the indexer (enumerating the map gave nothing live, 2026-10-08)
+        foreach (var code in map.CodeNames())
+        {
+          if (codes != null && !codes.Contains(code))
+            continue;
+          var seen = 0;
+          var pointsSeen = 0;
+          foreach (CorridorFeatureLine line in map[code])
+          {
+            seen++;
+            var points = new List<double[]>();
+            var offsets = new List<double>();
+            var stations = new List<double>();
+            foreach (FeatureLinePoint point in line.FeatureLinePoints)
+            {
+              points.Add(new[] { Math.Round(point.XYZ.X, decimals), Math.Round(point.XYZ.Y, decimals), Math.Round(point.XYZ.Z, decimals) });
+              offsets.Add(point.Offset);
+              stations.Add(point.Station);
+            }
+
+            pointsSeen += points.Count;
+            if (points.Count == 0)
+              continue;
+            var median = offsets.OrderBy(o => o).ElementAt(offsets.Count / 2);
+            lines.Add(new Dictionary<string, object?>
+            {
+              ["baseline"] = baseline.Name,
+              ["code"] = line.CodeName,
+              ["side"] = median < 0 ? "left" : median > 0 ? "right" : "center",
+              ["medianOffset"] = Math.Round(median, 3),
+              ["startStation"] = Math.Round(stations.Min(), 3),
+              ["endStation"] = Math.Round(stations.Max(), 3),
+              ["points"] = points,
+            });
+          }
+
+          diagnostics.Add(new Dictionary<string, object?>
+          {
+            ["baseline"] = baseline.Name, ["code"] = code, ["featureLines"] = seen, ["points"] = pointsSeen,
+          });
+        }
+      }
+
+      result["diagnostics"] = diagnostics;
+      result["lines"] = lines;
+      return result;
     });
   }
 
@@ -212,6 +255,238 @@ public static class CorridorCommands
       var referenceSurface = CivilObjectUtils.FindSurfaceByName(civilDoc, transaction, referenceSurfaceName, OpenMode.ForRead);
       return ComputeVolumeBetweenSurfaces(database, transaction, corridorSurface, referenceSurface);
     });
+  }
+
+  public static Task<object?> CreateCorridorAsync(JsonObject? parameters)
+  {
+    var name = PluginRuntime.GetRequiredString(parameters, "name");
+    var alignmentName = PluginRuntime.GetRequiredString(parameters, "alignmentName");
+    var profileName = PluginRuntime.GetRequiredString(parameters, "profileName");
+    var assemblyName = PluginRuntime.GetRequiredString(parameters, "assemblyName");
+    var baselineName = PluginRuntime.GetOptionalString(parameters, "baselineName") ?? "Baseline (1)";
+    var regionName = PluginRuntime.GetOptionalString(parameters, "regionName") ?? "Region (1)";
+    var startStation = PluginRuntime.GetOptionalDouble(parameters, "startStation");
+    var endStation = PluginRuntime.GetOptionalDouble(parameters, "endStation");
+    var frequency = CorridorEditingCommands.ReadFrequency(parameters);
+
+    return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      foreach (ObjectId existingId in civilDoc.CorridorCollection)
+      {
+        var existing = CivilObjectUtils.GetRequiredObject<Corridor>(transaction, existingId, OpenMode.ForRead);
+        if (string.Equals(existing.Name, name, StringComparison.OrdinalIgnoreCase))
+          throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"A corridor named '{name}' already exists.");
+      }
+
+      var alignment = CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName);
+      var profileId = FindProfileId(alignment, transaction, profileName);
+      var assembly = AssemblyCreationCommands.FindAssemblyByName(civilDoc, transaction, assemblyName, OpenMode.ForRead);
+
+      var corridorId = civilDoc.CorridorCollection.Add(name, baselineName, alignment.ObjectId, profileId, regionName, assembly.ObjectId);
+      var corridor = CivilObjectUtils.GetRequiredObject<Corridor>(transaction, corridorId, OpenMode.ForWrite);
+      if (corridor.Baselines.Count == 0 || corridor.Baselines[0].BaselineRegions.Count == 0)
+        throw new JsonRpcDispatchException("CIVIL3D.API_ERROR", "CorridorCollection.Add did not create a baseline region. The transaction was not committed.");
+
+      var region = corridor.Baselines[0].BaselineRegions[0];
+      if (startStation.HasValue || endStation.HasValue)
+      {
+        CorridorEditingCommands.ApplyStations(region, startStation, endStation);
+        CorridorEditingCommands.VerifyStations(region, startStation ?? region.StartStation, endStation ?? region.EndStation);
+      }
+      CorridorEditingCommands.ApplyFrequency(region, frequency);
+
+      // Not rebuilt here: targets are usually assigned next (target_mapping_set).
+      return new Dictionary<string, object?>
+      {
+        ["name"] = corridor.Name,
+        ["handle"] = CivilObjectUtils.GetHandle(corridor),
+        ["baselines"] = corridor.Baselines.Cast<Baseline>().Select(baseline => ToBaselineInfo(baseline, transaction)).ToList(),
+        ["state"] = GetCorridorState(corridor),
+        ["created"] = true,
+      };
+    });
+  }
+
+  public static Task<object?> CreateCorridorSurfaceAsync(JsonObject? parameters)
+  {
+    var corridorName = PluginRuntime.GetRequiredString(parameters, "corridorName");
+    var surfaceName = PluginRuntime.GetRequiredString(parameters, "surfaceName");
+    var linkCodes = (PluginRuntime.GetParameter(parameters, "linkCodes") as JsonArray)?
+      .Select(node => node?.GetValue<string>())
+      .Where(code => !string.IsNullOrWhiteSpace(code))
+      .Cast<string>()
+      .ToList() ?? new List<string>();
+    var addAsBreakline = PluginRuntime.GetOptionalBool(parameters, "addAsBreakline") ?? true;
+    var boundaryFromExtents = PluginRuntime.GetOptionalBool(parameters, "boundaryFromExtents") ?? true;
+    var overhangText = PluginRuntime.GetOptionalString(parameters, "overhangCorrection");
+    if (linkCodes.Count == 0)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "linkCodes must contain at least one code.");
+    OverhangCorrectionType? overhang = overhangText?.ToLowerInvariant() switch
+    {
+      null => null,
+      "none" => OverhangCorrectionType.None,
+      "top_links" => OverhangCorrectionType.TopLinks,
+      "bottom_links" => OverhangCorrectionType.BottomLinks,
+      _ => throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "overhangCorrection must be none, top_links, or bottom_links."),
+    };
+
+    return CivilExecution.WriteInCommandAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var corridor = CivilObjectUtils.FindCorridorByName(civilDoc, transaction, corridorName, OpenMode.ForWrite);
+      if (corridor.CorridorSurfaces.SurfaceNames().Contains(surfaceName, StringComparer.OrdinalIgnoreCase))
+        throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"Corridor '{corridorName}' already has a surface named '{surfaceName}'.");
+
+      var availableCodes = corridor.GetLinkCodes();
+      if (availableCodes.Length == 0)
+        throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"Corridor '{corridorName}' has no link codes yet; assign targets and rebuild first.");
+      var unknown = linkCodes.Where(code => !availableCodes.Contains(code, StringComparer.Ordinal)).ToList();
+      if (unknown.Count > 0)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
+          $"Unknown link code(s) {string.Join(", ", unknown)}. Available: {string.Join(", ", availableCodes)}.");
+
+      var corridorSurface = corridor.CorridorSurfaces.Add(surfaceName);
+      foreach (var code in linkCodes)
+        corridorSurface.AddLinkCode(code, addAsBreakline);
+      if (overhang.HasValue)
+        corridorSurface.OverhangCorrection = overhang.Value;
+      if (boundaryFromExtents)
+        corridorSurface.Boundaries.AddCorridorExtentsBoundary($"{surfaceName}_extents");
+
+      // No explicit Rebuild: Civil 3D builds the new surface when the command ends
+      // (live 2026-10-02); the corridor rebuild job can be run afterwards if needed.
+      var missingCodes = linkCodes.Except(corridorSurface.LinkCodes(), StringComparer.Ordinal).ToList();
+      if (missingCodes.Count > 0)
+        throw new JsonRpcDispatchException("CIVIL3D.API_ERROR",
+          $"Link code(s) {string.Join(", ", missingCodes)} did not persist on '{surfaceName}'. The transaction was not committed.");
+
+      return new Dictionary<string, object?>
+      {
+        ["corridorName"] = corridor.Name,
+        ["surfaceName"] = corridorSurface.Name,
+        ["surfaceHandle"] = corridorSurface.SurfaceId.IsNull ? null : corridorSurface.SurfaceId.Handle.ToString(),
+        ["linkCodes"] = corridorSurface.LinkCodes(),
+        ["overhangCorrection"] = corridorSurface.OverhangCorrection.ToString(),
+        ["boundaries"] = corridorSurface.Boundaries.BoundaryNames(),
+        ["state"] = GetCorridorState(corridor),
+      };
+    }, $"createCorridorSurface '{surfaceName}'", TimeSpan.FromSeconds(100));
+  }
+
+  /// <summary>
+  /// Erases a corridor; its corridor surfaces go with it and are listed in the result.
+  /// Runs in the deferred command like the other corridor-surface writes (see C5).
+  /// </summary>
+  public static Task<object?> DeleteCorridorAsync(JsonObject? parameters)
+  {
+    var corridorName = PluginRuntime.GetRequiredString(parameters, "corridorName");
+
+    return CivilExecution.WriteInCommandAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var corridor = CivilObjectUtils.FindCorridorByName(civilDoc, transaction, corridorName, OpenMode.ForWrite);
+      var surfaces = corridor.CorridorSurfaces.SurfaceNames();
+      corridor.Erase();
+      if (!corridor.IsErased)
+        throw new JsonRpcDispatchException("CIVIL3D.API_ERROR", $"Corridor '{corridorName}' was not erased. The transaction was not committed.");
+
+      return new Dictionary<string, object?>
+      {
+        ["corridorName"] = corridorName,
+        ["deleted"] = true,
+        ["removedSurfaces"] = surfaces,
+      };
+    }, $"deleteCorridor '{corridorName}'", TimeSpan.FromSeconds(100));
+  }
+
+  /// <summary>
+  /// Adds a polygon boundary to a corridor surface. Used when the corridor extents
+  /// boundary is rejected (Civil 3D: "crossing polygon" at baseline angle points, live
+  /// 2026-10-02); the polygon is typically the union of the section footprints.
+  /// </summary>
+  public static Task<object?> AddCorridorSurfaceBoundaryAsync(JsonObject? parameters)
+  {
+    var corridorName = PluginRuntime.GetRequiredString(parameters, "corridorName");
+    var surfaceName = PluginRuntime.GetRequiredString(parameters, "surfaceName");
+    var boundaryName = PluginRuntime.GetRequiredString(parameters, "boundaryName");
+    var replace = PluginRuntime.GetOptionalBool(parameters, "replace") ?? false;
+    var boundaryType = (PluginRuntime.GetOptionalString(parameters, "boundaryType") ?? "outside").ToLowerInvariant() switch
+    {
+      "outside" => CorridorSurfaceBoundaryType.OutsideBoundary,
+      "inside" => CorridorSurfaceBoundaryType.InsideBoundary,
+      _ => throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "boundaryType must be outside or inside."),
+    };
+    var points = ReadPolygon(PluginRuntime.GetParameter(parameters, "points") as JsonArray);
+
+    return CivilExecution.WriteInCommandAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var corridor = CivilObjectUtils.FindCorridorByName(civilDoc, transaction, corridorName, OpenMode.ForWrite);
+      var surface = corridor.CorridorSurfaces.Cast<CorridorSurface>()
+        .FirstOrDefault(candidate => string.Equals(candidate.Name, surfaceName, StringComparison.OrdinalIgnoreCase))
+        ?? throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Corridor surface '{surfaceName}' was not found on corridor '{corridorName}'.");
+
+      if (surface.Boundaries.BoundaryNames().Contains(boundaryName, StringComparer.OrdinalIgnoreCase))
+      {
+        if (!replace)
+          throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"Corridor surface '{surfaceName}' already has a boundary named '{boundaryName}'. Pass replace=true to replace it.");
+        surface.Boundaries.Remove(boundaryName);
+      }
+
+      var collection = new Point3dCollection();
+      foreach (var (x, y) in points) collection.Add(new Point3d(x, y, 0));
+      var boundary = surface.Boundaries.Add(boundaryName, collection);
+      boundary.BoundaryType = boundaryType;
+
+      if (!surface.Boundaries.BoundaryNames().Contains(boundaryName, StringComparer.OrdinalIgnoreCase))
+        throw new JsonRpcDispatchException("CIVIL3D.API_ERROR", $"Boundary '{boundaryName}' did not persist on '{surfaceName}'. The transaction was not committed.");
+
+      return new Dictionary<string, object?>
+      {
+        ["corridorName"] = corridor.Name,
+        ["surfaceName"] = surface.Name,
+        ["boundaryName"] = boundaryName,
+        ["boundaryType"] = boundary.BoundaryType.ToString(),
+        ["pointCount"] = points.Count,
+        ["boundaries"] = surface.Boundaries.BoundaryNames(),
+        ["replaced"] = replace,
+      };
+    }, $"addCorridorSurfaceBoundary '{surfaceName}/{boundaryName}'", TimeSpan.FromSeconds(100));
+  }
+
+  /// <summary>Reads at least three distinct XY points; a repeated closing point is dropped.</summary>
+  private static List<(double X, double Y)> ReadPolygon(JsonArray? array)
+  {
+    var points = new List<(double X, double Y)>();
+    foreach (var node in array ?? new JsonArray())
+    {
+      if (node is not JsonObject point || point["x"] is null || point["y"] is null)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Each boundary point must be an object with x and y.");
+      points.Add((point["x"]!.GetValue<double>(), point["y"]!.GetValue<double>()));
+    }
+    if (points.Count > 3 && points[0] == points[^1]) points.RemoveAt(points.Count - 1);
+    if (points.Distinct().Count() < 3)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "A boundary needs at least three distinct points.");
+    return points;
+  }
+
+  private static ObjectId FindProfileId(Alignment alignment, Transaction transaction, string profileName)
+  {
+    foreach (ObjectId profileId in alignment.GetProfileIds())
+    {
+      var profile = CivilObjectUtils.GetRequiredObject<Profile>(transaction, profileId, OpenMode.ForRead);
+      if (string.Equals(profile.Name, profileName, StringComparison.OrdinalIgnoreCase))
+        return profileId;
+    }
+    throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Profile '{profileName}' was not found on alignment '{alignment.Name}'.");
+  }
+
+  private static Dictionary<string, object?> ToBaselineInfo(Baseline baseline, Transaction transaction)
+  {
+    return new Dictionary<string, object?>
+    {
+      ["name"] = baseline.Name,
+      ["alignmentName"] = CivilObjectUtils.GetName(transaction.GetObject(baseline.AlignmentId, OpenMode.ForRead)) ?? string.Empty,
+      ["profileName"] = CivilObjectUtils.GetName(transaction.GetObject(baseline.ProfileId, OpenMode.ForRead)) ?? string.Empty,
+      ["regions"] = CorridorEditingCommands.ReadRegions(baseline, transaction),
+    };
   }
 
   private static Dictionary<string, object?> ToCorridorSummary(Corridor corridor)

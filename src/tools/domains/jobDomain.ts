@@ -6,6 +6,16 @@ const JobOperationSchema = z.enum([
   "publish_sheet_pdf",
   "surface_dem_import",
   "bulk_qc_report",
+  // C65: long surface work as jobs (0,5 M points took 6-7 min, past the 120 s client timeout)
+  "surface_add_points",
+  "surface_add_breakline",
+  "surface_add_boundary",
+  "surface_paste",
+  "surface_simplify",
+  "surface_build_options",
+  "surface_export_landxml",
+  // C94: transforming and writing a large base map may outlast the client timeout
+  "drawing_transform",
 ]);
 
 const JobStatusArgs = z.object({ action: z.literal("status"), jobId: z.string().min(1) });

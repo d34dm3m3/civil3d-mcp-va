@@ -49,6 +49,162 @@ internal static class FileBoundary
     return path;
   }
 
+  /// <summary>
+  /// C93/C94: a drawing to open or to read: inside the import or the export roots (a project drawing the plugin saved
+  /// lives in an export root), on a local disk, existing.
+  /// </summary>
+  public static string ResolveLocalReadPath(string rawPath, params string[] allowedExtensions)
+  {
+    var roots = ImportRoots.Value.Concat(ExportRoots.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    var path = ResolvePath(rawPath, roots, "source", allowedExtensions);
+    RequireLocalDisk(path);
+    if (!File.Exists(path))
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"File was not found: {path}");
+    }
+
+    return path;
+  }
+
+  /// <summary>
+  /// C94 review: whether two existing paths are the same file (volume and file index), so a short 8.3 name or a hard
+  /// link to the source is not taken for another file; false when either cannot be opened.
+  /// </summary>
+  public static bool SameFile(string first, string second)
+  {
+    using var a = CreateFileW(first, 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagBackupSemantics, IntPtr.Zero);
+    using var b = CreateFileW(second, 0, FileShare.ReadWrite | FileShare.Delete, IntPtr.Zero, FileMode.Open, FileFlagBackupSemantics, IntPtr.Zero);
+    if (a.IsInvalid || b.IsInvalid) return false;
+    return GetFileInformationByHandle(a, out var x) && GetFileInformationByHandle(b, out var y)
+      && x.VolumeSerialNumber == y.VolumeSerialNumber && x.FileIndexHigh == y.FileIndexHigh && x.FileIndexLow == y.FileIndexLow;
+  }
+
+  /// <summary>
+  /// C93: why a drawing could not be opened for editing, null when it can: read-only on disk, or held by another
+  /// program (another Civil 3D keeps an open drawing locked against writing). Probes by opening the file with write
+  /// access and sharing, writing nothing; without this AutoCAD would ask in a dialog.
+  /// </summary>
+  public static string? WriteAccessProblem(string path)
+  {
+    try
+    {
+      if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0) return "the file is read-only on disk";
+      using var probe = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+      return null;
+    }
+    catch (IOException)
+    {
+      return "the file is open in another program (or another Civil 3D)";
+    }
+    catch (UnauthorizedAccessException)
+    {
+      return "there is no write access to the file";
+    }
+  }
+
+  /// <summary>C94: an output file inside the export roots and on a local disk.</summary>
+  public static string ResolveLocalExportPath(string rawPath, bool overwrite, params string[] allowedExtensions)
+  {
+    var path = ResolveExportPath(rawPath, overwrite, allowedExtensions);
+    RequireLocalDisk(path);
+    return path;
+  }
+
+  /// <summary>
+  /// C93/C94: only files on the computer's own disks (policy: no network sources). Refuses UNC and device paths
+  /// (\\server\share, \\?\, \\.\), network drives, drives that do not exist and SUBST drives (a drive letter whose DOS
+  /// device is another path, \??\…, which may itself be a network share).
+  /// </summary>
+  public static void RequireLocalDisk(string path)
+  {
+    if (path.StartsWith(@"\\", StringComparison.Ordinal) || path.StartsWith("//", StringComparison.Ordinal))
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.PATH_NOT_ALLOWED", $"Only paths on a local disk are allowed (no UNC or device paths): {path}");
+    }
+
+    var root = Path.GetPathRoot(path);
+    if (root == null || root.Length < 2 || root[1] != ':' || !char.IsAsciiLetter(root[0]))
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.PATH_NOT_ALLOWED", $"Only paths on a local disk with a drive letter are allowed: {path}");
+    }
+
+    DriveType driveType;
+    try
+    {
+      driveType = new DriveInfo(root[..2]).DriveType;
+    }
+    catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException)
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.PATH_NOT_ALLOWED", $"The drive of the path could not be checked ({exception.Message}): {path}");
+    }
+
+    if (driveType is DriveType.Network or DriveType.NoRootDirectory or DriveType.Unknown)
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.PATH_NOT_ALLOWED", $"Only paths on a local disk are allowed ({root[..2]} is {driveType}): {path}");
+    }
+
+    var target = new StringBuilder(1024);
+    if (QueryDosDeviceW(root[..2], target, target.Capacity) != 0 && target.ToString().StartsWith(@"\??\", StringComparison.Ordinal))
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.PATH_NOT_ALLOWED", $"SUBST drives are not allowed ({root[..2]} is {target}): {path}");
+    }
+  }
+
+  /// <summary>
+  /// C94: writes a file through a temporary file in the target folder and moves it into place (the export directory
+  /// chain locked as for text files), so a failed write leaves no partial output and keeps an existing file.
+  /// <paramref name="writeTemp"/> gets the temporary path (same extension as the target).
+  /// </summary>
+  public static string WriteFileAtomic(
+    string rawPath,
+    bool overwrite,
+    Action<string> writeTemp,
+    params string[] allowedExtensions)
+  {
+    var path = ResolveLocalExportPath(rawPath, overwrite, allowedExtensions);
+    var directory = Path.GetDirectoryName(path)
+      ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Output path must include a directory.");
+    using var directoryLock = LockExportDirectoryChain(directory);
+
+    var tempPath = Path.Combine(directory, $".{Path.GetFileNameWithoutExtension(path)}.{Guid.NewGuid():N}.tmp{Path.GetExtension(path)}");
+    try
+    {
+      writeTemp(tempPath);
+      File.Move(tempPath, path, overwrite);
+      return path;
+    }
+    catch (IOException) when (!overwrite && File.Exists(path))
+    {
+      throw new JsonRpcDispatchException(
+        "CIVIL3D.CONFLICT",
+        $"Output file already exists: {path}. Set overwrite=true to replace it explicitly.");
+    }
+    catch (JsonRpcDispatchException)
+    {
+      throw;
+    }
+    catch (Exception exception)
+    {
+      throw new JsonRpcDispatchException(
+        "CIVIL3D.FILE_IO_ERROR",
+        $"Unable to write output file '{path}': {exception.Message}");
+    }
+    finally
+    {
+      try
+      {
+        if (File.Exists(tempPath))
+        {
+          File.Delete(tempPath);
+        }
+      }
+      catch
+      {
+        // Preserve the original operation result; the hidden temp file can be removed later.
+      }
+    }
+  }
+
   public static string WriteAllTextAtomic(
     string rawPath,
     string content,
@@ -367,6 +523,28 @@ internal static class FileBoundary
     FileMode creationDisposition,
     uint flagsAndAttributes,
     IntPtr templateFile);
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct ByHandleFileInformation
+  {
+    public uint FileAttributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  private static extern bool GetFileInformationByHandle(SafeFileHandle file, out ByHandleFileInformation information);
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern uint QueryDosDeviceW(string deviceName, StringBuilder targetPath, int maxLength);
 
   [DllImport("kernel32.dll", SetLastError = true)]
   [return: MarshalAs(UnmanagedType.Bool)]

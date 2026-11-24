@@ -108,6 +108,7 @@ public static class StyleCommands
       "point" => civilDoc.Styles.PointStyles.Cast<ObjectId>(),
       "section" => civilDoc.Styles.SectionStyles.Cast<ObjectId>(),
       "assembly" => civilDoc.Styles.AssemblyStyles.Cast<ObjectId>(),
+      "code_set" => civilDoc.Styles.CodeSetStyles.Cast<ObjectId>(),
       "label" => throw new JsonRpcDispatchException(
         "CIVIL3D.INVALID_INPUT",
         "'label' is a hierarchy of label-style collections, not one enumerable style collection. Use the civil3d_label tool for label-style operations."),

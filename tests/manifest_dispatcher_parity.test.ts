@@ -4,8 +4,9 @@ import { GENERATED_TOOL_CATALOG_ENTRIES } from "../src/tools/toolManifest.js";
 
 describe("manifest/dispatcher parity", () => {
   it("maps every manifest plugin method in the native dispatcher", () => {
-    const dispatcher = readFileSync(new URL("../Civil3D-MCP-Plugin/CommandDispatcher.cs", import.meta.url), "utf8");
-    const dispatched = new Set([...dispatcher.matchAll(/^\s*"([^"]+)"\s*=>/gm)].map((match) => match[1]));
+    // C152: the commands live in CommandRegistry.cs, one R("name", "Domain", kind, handler) per command.
+    const registry = readFileSync(new URL("../Civil3D-MCP-Plugin/CommandRegistry.cs", import.meta.url), "utf8");
+    const dispatched = new Set([...registry.matchAll(/^\s*R\("([^"]+)",/gm)].map((match) => match[1]));
     const declared = new Set(GENERATED_TOOL_CATALOG_ENTRIES.flatMap((entry) => entry.pluginMethods ?? []));
     const missing = [...declared].filter((method) => !dispatched.has(method)).sort();
 

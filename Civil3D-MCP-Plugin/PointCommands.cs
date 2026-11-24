@@ -47,6 +47,29 @@ public static class PointCommands
     });
   }
 
+  /// <summary>
+  /// C134 (2026-10-14): COGO points by number to a layer (an existing layer). Use case (a project): 135 points on one
+  /// layer made the drawing unreadable; the user wanted them split by type and the river bottom points turned off.
+  /// setCogoPointsLayer {numbers:[...], layer}. All numbers are checked first; nothing changes if one is missing.
+  /// </summary>
+  public static Task<object?> SetCogoPointsLayerAsync(JsonObject? parameters)
+  {
+    var numbers = (PluginRuntime.GetParameter(parameters, "numbers") as JsonArray)?.Select(n => n?.GetValue<int>() ?? 0).Distinct().ToList();
+    if (numbers == null || numbers.Count == 0 || numbers.Any(n => n <= 0))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "numbers must list positive point numbers. Nothing was changed.");
+    var layer = PluginRuntime.GetRequiredString(parameters, "layer");
+    return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var table = (Autodesk.AutoCAD.DatabaseServices.LayerTable)transaction.GetObject(database.LayerTableId, Autodesk.AutoCAD.DatabaseServices.OpenMode.ForRead);
+      if (!table.Has(layer))
+        throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"No layer '{layer}'. Nothing was changed.");
+      var points = numbers.Select(n => FindPointByNumber(civilDoc, transaction, (uint)n, Autodesk.AutoCAD.DatabaseServices.OpenMode.ForWrite)).ToList();
+      foreach (var point in points)
+        point.Layer = layer;
+      return new Dictionary<string, object?> { ["layer"] = layer, ["moved"] = points.Count };
+    });
+  }
+
   public static Task<object?> CreateCogoPointsAsync(JsonObject? parameters)
   {
     var pointsNode = PluginRuntime.GetParameter(parameters, "points") as JsonArray;
@@ -77,7 +100,8 @@ public static class PointCommands
         var objectId = collection.Add(new Point3d(x, y, z), description, true);
         var point = CivilObjectUtils.GetRequiredObject<CogoPoint>(transaction, objectId, Autodesk.AutoCAD.DatabaseServices.OpenMode.ForWrite);
 
-        if (startNumber.HasValue)
+        // C129 (2026-10-13): setting the number the point already got threw (internal error); set only a different one
+        if (startNumber.HasValue && point.PointNumber != (uint)(startNumber.Value + index))
         {
           point.PointNumber = (uint)(startNumber.Value + index);
         }

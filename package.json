@@ -39,15 +39,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sacred-G/Civil3D-mcp.git"
+    "url": "git+https://github.com/d34dm3m3/civil3d-mcp-va.git"
   },
   "keywords": [],
   "author": "Steven Bouldin",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/Sacred-G/Civil3D-mcp/issues"
+    "url": "https://github.com/d34dm3m3/civil3d-mcp-va/issues"
   },
-  "homepage": "https://github.com/Sacred-G/Civil3D-mcp#readme",
+  "homepage": "https://github.com/d34dm3m3/civil3d-mcp-va#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cheerio": "^1.0.0",

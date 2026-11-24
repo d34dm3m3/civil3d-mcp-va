@@ -285,7 +285,7 @@ public static class PlanProductionCommands
 
       viewport.UpgradeOpen();
       viewport.CustomScale = 1.0 / scale;
-      viewport.StandardScale = StandardScaleType.CustomScale;
+      // StandardScale = CustomScale is not settable (eInvalidInput); CustomScale alone is enough (C39b).
 
       return new Dictionary<string, object?>
       {

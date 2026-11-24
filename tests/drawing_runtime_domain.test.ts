@@ -11,4 +11,14 @@ describe("drawing runtime response contracts", () => {
       units: "feet",
     }).success).toBe(true);
   });
+
+  it("accepts drawing settings whose default styles are null (template without a corridor default)", () => {
+    const responseSchema = DRAWING_RUNTIME_DOMAIN_DEFINITION.actions.settings.responseSchema;
+
+    expect(responseSchema.safeParse({
+      coordinateSystem: "SWEREF-99-13-30",
+      defaultLayer: "0",
+      defaultStyles: { surface: "Standard", alignment: null, profile: "Standard", corridor: null, pipeNetwork: null },
+    }).success).toBe(true);
+  });
 });

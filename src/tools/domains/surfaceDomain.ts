@@ -189,6 +189,24 @@ const SurfaceDrainageWorkflowResponseSchema = z.object({
   runoffEstimate: HydrologyRunoffResponseSchema,
 });
 
+// LandXML export (C59): a surface is a name or { name, exportName?, description?, clip? }; clip keeps triangles whose
+// centroid lies inside the polygon (a large ground model cut to the work area)
+const LandXmlSurfaceSchema = z.union([
+  z.string(),
+  z.object({
+    name: z.string(),
+    exportName: z.string().optional(),
+    description: z.string().optional(),
+    clip: z.array(Point2DSchema).min(3).optional(),
+  }),
+]);
+
+const LandXmlCrsSchema = z.object({
+  name: z.string().optional(),
+  epsgCode: z.string().optional(),
+  verticalDatum: z.string().optional(),
+});
+
 const canonicalSurfaceInputShape = {
   action: z.enum([
     "list",
@@ -216,8 +234,28 @@ const canonicalSurfaceInputShape = {
     "create_from_dem",
     "comparison_workflow",
     "drainage_workflow",
+    "paste",
+    "simplify",
+    "build_options_set",
+    "find_gaps",
+    "export_landxml",
   ]),
   name: z.string().optional(),
+  surfaces: z.array(LandXmlSurfaceSchema).optional(),
+  outputPath: z.string().optional(),
+  overwrite: z.boolean().optional(),
+  decimals: z.number().int().min(0).max(6).optional(),
+  projectName: z.string().optional(),
+  crs: LandXmlCrsSchema.optional(),
+  sourceSurface: z.string().optional(),
+  simplifyMethod: z.enum(["point_removal", "edge_contraction"]).optional(),
+  maxElevationChange: z.number().positive().optional(),
+  region: z.array(Point2DSchema).optional(),
+  copyDeletedDependentObjects: z.boolean().optional(),
+  useMaximumTriangleLength: z.boolean().optional(),
+  maximumTriangleLength: z.number().positive().optional(),
+  minEdgeLength: z.number().positive().optional(),
+  maxClusters: z.number().int().positive().optional(),
   x: z.number().optional(),
   y: z.number().optional(),
   points: z.array(Point2DOr3DSchema).optional(),
@@ -292,6 +330,51 @@ const SurfaceCreateArgsSchema = z.object({
 const SurfaceDeleteArgsSchema = z.object({
   action: z.literal("delete"),
   name: z.string(),
+});
+
+const SurfacePasteArgsSchema = z.object({
+  action: z.literal("paste"),
+  name: z.string(),
+  sourceSurface: z.string(),
+});
+
+const SurfaceSimplifyArgsSchema = z.object({
+  action: z.literal("simplify"),
+  name: z.string(),
+  simplifyMethod: z.enum(["point_removal", "edge_contraction"]).optional(),
+  maxElevationChange: z.number().positive(),
+  region: z.array(Point2DSchema).min(3).optional(),
+});
+
+const SurfaceBuildOptionsSetArgsSchema = z.object({
+  action: z.literal("build_options_set"),
+  name: z.string(),
+  copyDeletedDependentObjects: z.boolean().optional(),
+  useMaximumTriangleLength: z.boolean().optional(),
+  maximumTriangleLength: z.number().positive().optional(),
+}).refine(
+  (args) => args.copyDeletedDependentObjects !== undefined
+    || args.useMaximumTriangleLength !== undefined
+    || args.maximumTriangleLength !== undefined,
+  { message: "Give at least one build option." },
+);
+
+const SurfaceFindGapsArgsSchema = z.object({
+  action: z.literal("find_gaps"),
+  name: z.string(),
+  minEdgeLength: z.number().positive().optional(),
+  region: z.array(Point2DSchema).min(3).optional(),
+  maxClusters: z.number().int().positive().optional(),
+});
+
+const SurfaceExportLandXmlArgsSchema = z.object({
+  action: z.literal("export_landxml"),
+  surfaces: z.array(LandXmlSurfaceSchema).min(1),
+  outputPath: z.string(),
+  overwrite: z.boolean().optional(),
+  decimals: z.number().int().min(0).max(6).optional(),
+  projectName: z.string().optional(),
+  crs: LandXmlCrsSchema.optional(),
 });
 
 const SurfaceAddPointsArgsSchema = z.object({
@@ -534,6 +617,91 @@ export const SURFACE_DOMAIN_DEFINITION: DomainToolDefinition = {
       execute: async (args) => await withApplicationConnection(
         async (appClient) => await appClient.sendCommand("deleteSurface", {
           name: args.name,
+        }),
+      ),
+    },
+    paste: {
+      action: "paste",
+      inputSchema: SurfacePasteArgsSchema,
+      responseSchema: GenericSurfaceResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["pasteSurface"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("pasteSurface", {
+          surfaceName: args.name,
+          sourceSurfaceName: args.sourceSurface,
+        }),
+      ),
+    },
+    simplify: {
+      action: "simplify",
+      inputSchema: SurfaceSimplifyArgsSchema,
+      responseSchema: GenericSurfaceResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["simplifySurface"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("simplifySurface", {
+          surfaceName: args.name,
+          method: args.simplifyMethod ?? "point_removal",
+          maxElevationChange: args.maxElevationChange,
+          region: args.region ?? null,
+        }),
+      ),
+    },
+    build_options_set: {
+      action: "build_options_set",
+      inputSchema: SurfaceBuildOptionsSetArgsSchema,
+      responseSchema: GenericSurfaceResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["setSurfaceBuildOptions"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("setSurfaceBuildOptions", {
+          surfaceName: args.name,
+          copyDeletedDependentObjects: args.copyDeletedDependentObjects ?? null,
+          useMaximumTriangleLength: args.useMaximumTriangleLength ?? null,
+          maximumTriangleLength: args.maximumTriangleLength ?? null,
+        }),
+      ),
+    },
+    find_gaps: {
+      action: "find_gaps",
+      inputSchema: SurfaceFindGapsArgsSchema,
+      responseSchema: GenericSurfaceResponseSchema,
+      capabilities: ["query", "analyze"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["findSurfaceGaps"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("findSurfaceGaps", {
+          surfaceName: args.name,
+          minEdgeLength: args.minEdgeLength ?? 10,
+          region: args.region ?? null,
+          maxClusters: args.maxClusters ?? 50,
+        }),
+      ),
+    },
+    export_landxml: {
+      action: "export_landxml",
+      inputSchema: SurfaceExportLandXmlArgsSchema,
+      responseSchema: GenericSurfaceResponseSchema,
+      capabilities: ["export"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["exportLandXml"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("exportLandXml", {
+          surfaces: args.surfaces,
+          outputPath: args.outputPath,
+          overwrite: args.overwrite ?? false,
+          decimals: args.decimals ?? 3,
+          projectName: args.projectName ?? null,
+          coordinateSystem: args.crs ?? null,
         }),
       ),
     },
@@ -951,6 +1119,11 @@ export const SURFACE_DOMAIN_DEFINITION: DomainToolDefinition = {
         "create_from_dem",
         "comparison_workflow",
         "drainage_workflow",
+        "paste",
+        "simplify",
+        "build_options_set",
+        "find_gaps",
+        "export_landxml",
       ],
       resolveAction: (rawArgs) => ({
         action: String(rawArgs.action ?? ""),

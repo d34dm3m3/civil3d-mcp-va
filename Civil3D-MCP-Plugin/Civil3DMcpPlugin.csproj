@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <NoWarn>$(NoWarn);MSB3277</NoWarn>
@@ -38,6 +38,11 @@
     </Reference>
     <Reference Include="AeccPressurePipesMgd">
       <HintPath>$(Civil3DReferencesPath)\AeccPressurePipesMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- Data shortcut projects (C61): Autodesk.Civil.DataShortcuts.DataShortcuts is in its own assembly -->
+    <Reference Include="AeccDataShortcutMgd">
+      <HintPath>$(Civil3DReferencesPath)\AeccDataShortcutMgd.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>

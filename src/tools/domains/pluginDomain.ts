@@ -7,6 +7,9 @@ const HealthResponseSchema = z.object({
   civil3dVersion: z.string().optional(),
   pluginVersion: z.string().optional(),
   drawingLoaded: z.boolean(),
+  // C93c: the drawing the next call runs in, and how many drawings are open.
+  activeDocument: z.string().nullable().optional(),
+  documentCount: z.number().optional(),
   operationInProgress: z.boolean(),
   currentOperation: z.string().nullable(),
   queueDepth: z.number(),

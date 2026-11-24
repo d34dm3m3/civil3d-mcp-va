@@ -21,6 +21,13 @@ const PipeFlowSchema = z.object({
 
 const GenericPipeResponseSchema = z.object({}).passthrough();
 
+const RunVertexSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  z: z.number(),
+  structure: z.string().min(1).optional(),
+  structureDiameter: z.number().positive().optional(),
+});
 const canonicalPipeInputShape = {
   action: z.enum([
     "list",
@@ -37,6 +44,24 @@ const canonicalPipeInputShape = {
     "get_structure_properties",
     "size_network",
     "automate_profile_view",
+    "network_profile_view_add",
+    "network_build",
+    "structure_rotation_set",
+    "network_delete",
+    "catalog_families",
+    "parts_list_family_add",
+    "parts_list_style_set",
+    "parts_list_sizes_add",
+    "parts_list_family_remove",
+    "parts_list_size_data_get",
+    "parts_list_size_data_set",
+    "network_labels_add",
+    "network_labels_delete",
+    "network_clearance",
+    "network_quantities",
+    "part_style_get",
+    "part_style_set",
+    "part_style_copy",
     "list_pressure_networks",
     "get_pressure_network",
     "create_pressure_network",
@@ -53,6 +78,13 @@ const canonicalPipeInputShape = {
     "get_pressure_fitting_properties",
     "add_pressure_appurtenance",
   ]),
+  fromStyle: z.string().optional(),
+  // C79: parts_list_sizes_add; C98d: parts_list_size_data_get/set (size names or 0-based indexes)
+  sizes: z.array(z.union([z.string(), z.number()])).optional(),
+  values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().describe("parts_list_size_data_set: field (name, context or description) -> value, e.g. {\"Material\": \"PE\"}."),
+  dryRun: z.boolean().optional(),
+  all: z.boolean().optional(),
+  field: z.string().optional(),
   name: z.string().optional(),
   networkName: z.string().optional(),
   pipeName: z.string().optional(),
@@ -105,6 +137,40 @@ const canonicalPipeInputShape = {
   position: OptionalPoint3DSchema.optional(),
   rotation: z.number().optional(),
   onPipeName: z.string().optional(),
+  pipeFamily: z.string().optional(),
+  pipeDiameter: z.number().optional(),
+  namePrefix: z.string().optional(),
+  defaultStructure: z.string().optional(),
+  replace: z.boolean().optional(),
+  vertices: z.array(RunVertexSchema).optional(),
+  familyName: z.string().optional(),
+  domain: z.enum(["pipe", "structure"]).optional(),
+  sourcePartsList: z.string().optional(),
+  createPartsList: z.boolean().optional(),
+  pipeStyle: z.string().optional(),
+  structureStyles: z.record(z.string(), z.string()).optional(),
+  labelStyle: z.string().optional(),
+  target: z.enum(["plan", "profile"]).optional(),
+  partKind: z.enum(["pipe", "structure", "spanning"]).optional(),
+  partFamily: z.string().optional(),
+  ratio: z.number().min(0).max(1).optional(),
+  networks: z.array(z.string()).optional(),
+  minClearance: z.number().optional(),
+  includeSameRun: z.boolean().optional(),
+  ignorePairs: z.array(z.tuple([z.string(), z.string()])).optional(),
+  limit: z.number().optional(),
+  kind: z.enum(["pipe", "structure"]).optional(),
+  newName: z.string().optional(),
+  options: z.record(z.string(), z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]))).optional(),
+  display: z.record(z.string(), z.record(z.string(), z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])))).optional(),
+  alignStructuresToPipes: z.boolean().optional(),
+  keepProfileViews: z.boolean().optional(),
+  networkNames: z.array(z.string().min(1)).min(1).optional(),
+  profileViewNames: z.array(z.string().min(1)).min(1).optional(),
+  structureNames: z.array(z.string()).optional(),
+  rotationDegrees: z.number().optional().describe("Structure plan rotation, degrees counterclockwise from +X (WCS)."),
+  alignToPipe: z.boolean().optional(),
+  offsetDegrees: z.number().optional(),
 };
 
 const PipeListArgsSchema = z.object({ action: z.literal("list") });
@@ -153,6 +219,151 @@ const PipeAddStructureArgsSchema = z.object({
   sumpDepth: z.number().optional(),
 });
 const PipeCatalogListArgsSchema = z.object({ action: z.literal("catalog_list"), partsList: z.string().optional() });
+const PipeNetworkBuildArgsSchema = z.object({
+  action: z.literal("network_build"),
+  networkName: z.string().min(1),
+  partsList: z.string().min(1),
+  referenceSurface: z.string().optional(),
+  referenceAlignment: z.string().optional(),
+  pipeFamily: z.string().min(1),
+  pipeDiameter: z.number().positive(),
+  namePrefix: z.string().min(1),
+  defaultStructure: z.string().min(1).optional(),
+  replace: z.boolean().optional(),
+  vertices: z.array(RunVertexSchema).min(2),
+  pipeStyle: z.string().min(1).optional(),
+  structureStyles: z.record(z.string().min(1), z.string().min(1)).optional(),
+  alignStructuresToPipes: z.boolean().optional(),
+  // C63: put the rebuilt run back into the profile views that showed the old one (same transaction)
+  keepProfileViews: z.boolean().optional(),
+});
+// Plan rotation of structures: absolute (rotationDegrees, CCW from +X in WCS) or along the connected pipes
+// (alignToPipe: one pipe = its axis start to end, two = mean axis), plus offsetDegrees.
+const PipeStructureRotationSetArgsSchema = z.object({
+  action: z.literal("structure_rotation_set"),
+  networkName: z.string().min(1),
+  structureNames: z.array(z.string().min(1)).min(1).optional(),
+  namePrefix: z.string().min(1).optional(),
+  partFamily: z.string().min(1).optional(),
+  rotationDegrees: z.number().optional(),
+  alignToPipe: z.boolean().optional(),
+  offsetDegrees: z.number().optional(),
+}).refine((a) => (a.rotationDegrees !== undefined) !== (a.alignToPipe === true), { message: "Give either rotationDegrees or alignToPipe: true." });
+const PipeNetworkDeleteArgsSchema = z.object({ action: z.literal("network_delete"), networkName: z.string().min(1) });
+const PipeCatalogFamiliesArgsSchema = z.object({
+  action: z.literal("catalog_families"),
+  domain: z.enum(["pipe", "structure"]).optional(),
+});
+const PipePartsListFamilyAddArgsSchema = z.object({
+  action: z.literal("parts_list_family_add"),
+  partsList: z.string().min(1),
+  familyName: z.string().min(1),
+  domain: z.enum(["pipe", "structure"]),
+  sourcePartsList: z.string().min(1).optional(),
+  createPartsList: z.boolean().optional(),
+});
+// C82: remove a family from a parts list (parts already in drawings keep their data).
+const PipePartsListFamilyRemoveArgsSchema = z.object({
+  action: z.literal("parts_list_family_remove"), partsList: z.string().min(1), familyName: z.string().min(1), domain: z.enum(["pipe", "structure"]),
+});
+// C79: catalog sizes into a family already in a parts list (by the size filter's list field; given ones or all).
+const PipePartsListSizesAddArgsSchema = z.object({
+  action: z.literal("parts_list_sizes_add"),
+  partsList: z.string().min(1),
+  familyName: z.string().min(1),
+  domain: z.enum(["pipe", "structure"]),
+  sizes: z.array(z.union([z.string(), z.number()])).min(1).optional(),
+  all: z.boolean().optional(),
+  field: z.string().min(1).optional(),
+  dryRun: z.boolean().optional(),   // C156: was stripped here, so a dry run added the sizes
+}).refine((a) => a.all === true || (a.sizes?.length ?? 0) > 0, { message: "Give sizes or all: true." });
+// C98d: the data of the sizes of a parts list family (PartSize.SizeDataRecord) with the size filter's data source and
+// allowed values; write fields (e.g. Material) where the catalog lets the parts list choose them (list, range or optional
+// data source, a value the list or range allows). Sizes by name or 0-based index, default all.
+const SizeSelector = z.union([z.string().min(1), z.number().int().min(0)]);
+const PipePartsListSizeDataGetArgsSchema = z.object({
+  action: z.literal("parts_list_size_data_get"), partsList: z.string().min(1), familyName: z.string().min(1).optional(),
+  domain: z.enum(["pipe", "structure"]).optional(), sizes: z.array(SizeSelector).min(1).optional(), field: z.string().min(1).optional(),
+}).refine((a) => a.familyName !== undefined || (a.sizes === undefined && a.field === undefined), { message: "sizes and field need familyName" });
+const PipePartsListSizeDataSetArgsSchema = z.object({
+  action: z.literal("parts_list_size_data_set"), partsList: z.string().min(1), familyName: z.string().min(1),
+  domain: z.enum(["pipe", "structure"]).optional(), sizes: z.array(SizeSelector).min(1).optional(),
+  values: z.record(z.string().trim().min(1), z.union([z.string(), z.number(), z.boolean()])).refine((v) => Object.keys(v).length > 0, { message: "give at least one field" }),
+  dryRun: z.boolean().optional(),
+});
+// C63: several networks into several profile views in one transaction (networkNames/profileViewNames)
+const PipeNetworkProfileViewAddArgsSchema = z.object({
+  action: z.literal("network_profile_view_add"),
+  networkName: z.string().min(1).optional(),
+  profileViewName: z.string().min(1).optional(),
+  networkNames: z.array(z.string().min(1)).min(1).optional(),
+  profileViewNames: z.array(z.string().min(1)).min(1).optional(),
+  namePrefix: z.string().min(1).optional(),
+}).refine((a) => (a.networkName !== undefined) !== (a.networkNames !== undefined), { message: "Give networkName or networkNames." })
+  .refine((a) => (a.profileViewName !== undefined) !== (a.profileViewNames !== undefined), { message: "Give profileViewName or profileViewNames." });
+const PartStyleKind = z.enum(["pipe", "structure"]);
+const StyleValue = z.union([z.string(), z.number(), z.boolean()]);
+const PipePartStyleGetArgsSchema = z.object({ action: z.literal("part_style_get"), kind: PartStyleKind, style: z.string().min(1) });
+const PipePartStyleCopyArgsSchema = z.object({
+  action: z.literal("part_style_copy"), kind: PartStyleKind, style: z.string().min(1), newName: z.string().min(1),
+});
+const PipePartStyleSetArgsSchema = z.object({
+  action: z.literal("part_style_set"),
+  kind: PartStyleKind,
+  style: z.string().min(1),
+  options: z.record(z.enum(["plan", "profile", "section", "model"]), z.record(z.string().min(1), StyleValue)).optional(),
+  display: z.record(z.enum(["plan", "profile", "section", "model"]), z.record(z.string().min(1), z.object({
+    visible: z.boolean().optional(),
+    layer: z.string().min(1).optional(),
+    color: z.union([z.string(), z.number().int()]).optional(),
+    linetype: z.string().min(1).optional(),
+    linetypeScale: z.number().positive().optional(),
+    lineweight: z.number().int().optional(),
+  }))).optional(),
+}).refine((a) => Boolean(a.options && Object.keys(a.options).length) || Boolean(a.display && Object.keys(a.display).length), {
+  message: "give options and/or display",
+});
+const PipeNetworkClearanceArgsSchema = z.object({
+  action: z.literal("network_clearance"),
+  networks: z.array(z.string().min(1)).min(1),
+  minClearance: z.number().optional(),
+  includeSameRun: z.boolean().optional(),
+  ignorePairs: z.array(z.tuple([z.string().min(1), z.string().min(1)])).optional(),
+  limit: z.number().int().min(1).max(5000).optional(),
+});
+const PipeNetworkQuantitiesArgsSchema = z.object({
+  action: z.literal("network_quantities"),
+  networks: z.array(z.string().min(1)).optional(),
+});
+const PipePartsListStyleSetArgsSchema = z.object({
+  action: z.literal("parts_list_style_set"),
+  partsList: z.string().min(1),
+  familyName: z.string().min(1),
+  domain: z.enum(["pipe", "structure"]),
+  style: z.string().min(1),
+  fromStyle: z.string().min(1).optional(),   // C81: only sizes whose current style is this
+});
+const NetworkLabelsBase = {
+  networkName: z.string().min(1),
+  target: z.enum(["plan", "profile"]),
+  partKind: z.enum(["pipe", "structure", "spanning"]),
+  profileViewName: z.string().min(1).optional(),
+  namePrefix: z.string().min(1).optional(),
+  partFamily: z.string().min(1).optional(),
+};
+const needsView = (a: { target: string; profileViewName?: string }) => a.target !== "profile" || Boolean(a.profileViewName);
+const PipeNetworkLabelsAddArgsSchema = z.object({
+  action: z.literal("network_labels_add"),
+  ...NetworkLabelsBase,
+  labelStyle: z.string().min(1),
+  ratio: z.number().min(0).max(1).optional(),
+  replace: z.boolean().optional(),
+  layer: z.string().min(1).optional(),
+}).refine(needsView, { message: "profileViewName is required for target 'profile'" });
+const PipeNetworkLabelsDeleteArgsSchema = z.object({
+  action: z.literal("network_labels_delete"),
+  ...NetworkLabelsBase,
+}).refine(needsView, { message: "profileViewName is required for target 'profile'" });
 const PipeCalculateHglArgsSchema = z.object({
   action: z.literal("calculate_hgl"),
   networkName: z.string(),
@@ -451,6 +662,244 @@ export const PIPE_DOMAIN_DEFINITION: DomainToolDefinition = {
       safeForRetry: true,
       pluginMethods: ["listPipePartsCatalog"],
       execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("listPipePartsCatalog", { partsList: args.partsList })),
+    },
+    network_build: {
+      action: "network_build",
+      inputSchema: PipeNetworkBuildArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["create", "edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["buildPipeNetworkRun"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("buildPipeNetworkRun", {
+        networkName: args.networkName,
+        partsList: args.partsList,
+        referenceSurface: args.referenceSurface,
+        referenceAlignment: args.referenceAlignment,
+        pipeFamily: args.pipeFamily,
+        pipeDiameter: args.pipeDiameter,
+        namePrefix: args.namePrefix,
+        defaultStructure: args.defaultStructure ?? "Brytpunkt",
+        replace: args.replace ?? false,
+        vertices: args.vertices,
+        pipeStyle: args.pipeStyle,
+        structureStyles: args.structureStyles,
+        alignStructuresToPipes: args.alignStructuresToPipes,
+        keepProfileViews: args.keepProfileViews,
+      })),
+    },
+    structure_rotation_set: {
+      action: "structure_rotation_set",
+      inputSchema: PipeStructureRotationSetArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["setStructureRotation"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("setStructureRotation", {
+        networkName: args.networkName,
+        structureNames: args.structureNames,
+        namePrefix: args.namePrefix,
+        partFamily: args.partFamily,
+        rotationDegrees: args.rotationDegrees,
+        alignToPipe: args.alignToPipe ?? false,
+        offsetDegrees: args.offsetDegrees ?? 0,
+      })),
+    },
+    network_delete: {
+      action: "network_delete",
+      inputSchema: PipeNetworkDeleteArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["delete"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["deletePipeNetwork"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("deletePipeNetwork", { networkName: args.networkName })),
+    },
+    catalog_families: {
+      action: "catalog_families",
+      inputSchema: PipeCatalogFamiliesArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["listCatalogPartFamilies"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("listCatalogPartFamilies", { domain: args.domain })),
+    },
+    parts_list_family_add: {
+      action: "parts_list_family_add",
+      inputSchema: PipePartsListFamilyAddArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["create", "edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["addPartsListFamily"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("addPartsListFamily", {
+        partsList: args.partsList,
+        familyName: args.familyName,
+        domain: args.domain,
+        sourcePartsList: args.sourcePartsList,
+        createPartsList: args.createPartsList ?? false,
+      })),
+    },
+    part_style_get: {
+      action: "part_style_get",
+      inputSchema: PipePartStyleGetArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["getPartStyle"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("getPartStyle", { kind: args.kind, style: args.style })),
+    },
+    part_style_copy: {
+      action: "part_style_copy",
+      inputSchema: PipePartStyleCopyArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["create"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["copyPartStyle"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("copyPartStyle", { kind: args.kind, style: args.style, newName: args.newName })),
+    },
+    part_style_set: {
+      action: "part_style_set",
+      inputSchema: PipePartStyleSetArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["setPartStyle"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("setPartStyle", {
+        kind: args.kind, style: args.style, options: args.options, display: args.display,
+      })),
+    },
+    network_clearance: {
+      action: "network_clearance",
+      inputSchema: PipeNetworkClearanceArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["networkClearance"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("networkClearance", {
+        networks: args.networks, minClearance: args.minClearance ?? 0, includeSameRun: args.includeSameRun ?? false,
+        ignorePairs: args.ignorePairs ?? [], limit: args.limit ?? 100,
+      })),
+    },
+    network_quantities: {
+      action: "network_quantities",
+      inputSchema: PipeNetworkQuantitiesArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["networkQuantities"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("networkQuantities", { networks: args.networks })),
+    },
+    parts_list_style_set: {
+      action: "parts_list_style_set",
+      inputSchema: PipePartsListStyleSetArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["setPartsListFamilyStyle"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("setPartsListFamilyStyle", {
+        partsList: args.partsList, familyName: args.familyName, domain: args.domain, style: args.style, fromStyle: args.fromStyle,
+      })),
+    },
+    parts_list_family_remove: {
+      action: "parts_list_family_remove",
+      inputSchema: PipePartsListFamilyRemoveArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["delete"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["removePartsListFamily"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("removePartsListFamily", {
+        partsList: args.partsList, familyName: args.familyName, domain: args.domain,
+      })),
+    },
+    parts_list_sizes_add: {
+      action: "parts_list_sizes_add",
+      inputSchema: PipePartsListSizesAddArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["create", "edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["addPartsListSizes"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("addPartsListSizes", {
+        partsList: args.partsList, familyName: args.familyName, domain: args.domain, sizes: (args.sizes as Array<string | number> | undefined)?.map(String), all: args.all, field: args.field, dryRun: args.dryRun,
+      })),
+    },
+    // C98d: size data of a parts list family (read without approval; writing behind approval).
+    parts_list_size_data_get: {
+      action: "parts_list_size_data_get",
+      inputSchema: PipePartsListSizeDataGetArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["partsListSizeDataGet"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("partsListSizeDataGet", {
+        partsList: args.partsList, familyName: args.familyName, domain: args.domain, sizes: args.sizes, field: args.field,
+      })),
+    },
+    parts_list_size_data_set: {
+      action: "parts_list_size_data_set",
+      inputSchema: PipePartsListSizeDataSetArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["partsListSizeDataSet"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("partsListSizeDataSet", {
+        partsList: args.partsList, familyName: args.familyName, domain: args.domain, sizes: args.sizes, values: args.values, dryRun: args.dryRun,
+      })),
+    },
+    network_labels_add: {
+      action: "network_labels_add",
+      inputSchema: PipeNetworkLabelsAddArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["create", "edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["addNetworkLabels"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("addNetworkLabels", {
+        networkName: args.networkName, target: args.target, partKind: args.partKind, profileViewName: args.profileViewName,
+        namePrefix: args.namePrefix, partFamily: args.partFamily, labelStyle: args.labelStyle, ratio: args.ratio ?? 0.5,
+        replace: args.replace ?? false, layer: args.layer,
+      })),
+    },
+    network_labels_delete: {
+      action: "network_labels_delete",
+      inputSchema: PipeNetworkLabelsDeleteArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["delete"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["deleteNetworkLabels"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("deleteNetworkLabels", {
+        networkName: args.networkName, target: args.target, partKind: args.partKind, profileViewName: args.profileViewName,
+        namePrefix: args.namePrefix, partFamily: args.partFamily,
+      })),
+    },
+    network_profile_view_add: {
+      action: "network_profile_view_add",
+      inputSchema: PipeNetworkProfileViewAddArgsSchema,
+      responseSchema: GenericPipeResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["addNetworkToProfileView"],
+      execute: async (args) => await withApplicationConnection(async (appClient) => await appClient.sendCommand("addNetworkToProfileView", {
+        networkName: args.networkName,
+        profileViewName: args.profileViewName,
+        networkNames: args.networkNames,
+        profileViewNames: args.profileViewNames,
+        namePrefix: args.namePrefix,
+      })),
     },
     calculate_hgl: {
       action: "calculate_hgl",
@@ -807,6 +1256,9 @@ export const PIPE_DOMAIN_DEFINITION: DomainToolDefinition = {
       supportedActions: [
         "list", "get", "get_pipe", "get_structure", "check_interference", "create", "add_pipe", "add_structure",
         "catalog_list", "calculate_hgl", "hydraulic_analysis", "get_structure_properties", "size_network", "automate_profile_view",
+        "network_profile_view_add", "network_build", "structure_rotation_set", "network_delete", "catalog_families", "parts_list_family_add",
+        "parts_list_style_set", "parts_list_sizes_add", "parts_list_family_remove", "parts_list_size_data_get", "parts_list_size_data_set", "network_labels_add", "network_labels_delete", "network_clearance", "network_quantities",
+        "part_style_get", "part_style_set", "part_style_copy",
         "list_pressure_networks", "get_pressure_network", "create_pressure_network", "delete_pressure_network",
         "assign_pressure_parts_list", "set_pressure_cover", "validate_pressure_network", "export_pressure_network",
         "connect_pressure_networks", "add_pressure_pipe", "get_pressure_pipe_properties", "resize_pressure_pipe",

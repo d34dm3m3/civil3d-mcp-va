@@ -129,7 +129,7 @@ public static class ParcelEditingCommands
       if (!string.IsNullOrWhiteSpace(sourceHandle))
       {
         // Create from existing entity handle
-        var handle = new Handle(Convert.ToInt64(sourceHandle, 16));
+        var handle = CivilObjectUtils.ParseHandle(sourceHandle);
         if (!database.TryGetObjectId(handle, out var entityId) || entityId.IsNull)
           throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND",
             $"Entity with handle '{sourceHandle}' was not found.");
@@ -144,7 +144,7 @@ public static class ParcelEditingCommands
       else
       {
         throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
-          "createParcel requires either a sourceHandle (entity handle) or a points array with ≥3 vertices.");
+          "createParcel requires either a sourceHandle (entity handle) or a points array with at least 3 vertices.");
       }
 
       if (newParcelId.IsNull)

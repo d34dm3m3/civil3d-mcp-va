@@ -18,22 +18,120 @@ public static class ProfileEditCommands
   {
     var alignmentName = PluginRuntime.GetRequiredString(parameters, "alignmentName");
     var profileName = PluginRuntime.GetRequiredString(parameters, "profileName");
-    var station = PluginRuntime.GetRequiredDouble(parameters, "station");
-    var elevation = PluginRuntime.GetRequiredDouble(parameters, "elevation");
+    // C63 (2026-10-08): many PVIs in one transaction. Every committed profile edit makes Civil 3D update the
+    // profile views on the alignment (live: about 100 s per commit with nine views and their pipe networks),
+    // so 82 single add_pvi calls took hours. pvis = [{station, elevation}]; replaceAll removes the profile's PVIs
+    // first, in the same transaction, so the profile object (and corridors built on it) stays.
+    var list = PluginRuntime.GetParameter(parameters, "pvis") as JsonArray;
+    var replaceAll = PluginRuntime.GetOptionalBool(parameters, "replaceAll") ?? false;
+    List<(double Station, double Elevation)> pvis;
+    if (list != null)
+    {
+      pvis = list.Select(n => n is JsonObject o
+          ? (o["station"]?.GetValue<double>() ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Each pvi needs station."),
+             o["elevation"]?.GetValue<double>() ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Each pvi needs elevation."))
+          : throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Each pvi must be an object {station, elevation}."))
+        .ToList();
+      if (pvis.Count == 0)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "pvis is empty. Nothing was changed.");
+      if (pvis.Select(p => Math.Round(p.Station, 6)).Distinct().Count() != pvis.Count)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "pvis has the same station twice. Nothing was changed.");
+    }
+    else
+    {
+      if (replaceAll)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "replaceAll needs pvis. Nothing was changed.");
+      pvis = new List<(double, double)> { (PluginRuntime.GetRequiredDouble(parameters, "station"), PluginRuntime.GetRequiredDouble(parameters, "elevation")) };
+    }
 
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var alignment = CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName);
       var profile = CivilObjectUtils.FindProfileByName(alignment, transaction, profileName, OpenMode.ForWrite);
 
-      profile.PVIs.AddPVI(station, elevation);
+      var removed = 0;
+      var ordered = pvis.OrderBy(p => p.Station).ToList();
+      if (replaceAll && profile.PVIs.Count > 0)
+      {
+        // Civil 3D will not remove the first or the last PVI (live 2026-10-08), and moving an end PVI's station
+        // failed the same way. So: an end at the same station (1 mm) only gets the new elevation, otherwise the new
+        // end is added first (the old end becomes an inner PVI); then every inner PVI is removed by index.
+        var first = ordered[0];
+        var last = ordered[^1];
+        var oldFirst = profile.PVIs[0].RawStation;
+        var oldLast = profile.PVIs[profile.PVIs.Count - 1].RawStation;
+        try
+        {
+          foreach (var end in ordered.Count > 1 ? new[] { first, last } : new[] { first })
+          {
+            ProfilePVI? same = null;
+            for (var i = 0; i < profile.PVIs.Count; i++)
+              if (Math.Abs(profile.PVIs[i].RawStation - end.Station) < 0.001) same = profile.PVIs[i];
+            if (same != null) same.Elevation = end.Elevation;
+            else profile.PVIs.AddPVI(end.Station, end.Elevation);
+          }
+
+          for (var i = profile.PVIs.Count - 2; i >= 1; i--)
+          {
+            profile.PVIs.RemoveAt(i);
+            removed++;
+          }
+        }
+        catch (InvalidOperationException ex)
+        {
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
+            $"replaceAll on '{profile.Name}': {ex.Message} (old PVIs {oldFirst:F4}-{oldLast:F4}, new {first.Station:F4}-{last.Station:F4}; "
+            + "an old end outside the new range cannot be removed). Nothing was changed.");
+        }
+
+        if (profile.PVIs.Count != Math.Min(2, ordered.Count)
+            || Math.Abs(profile.PVIs[0].RawStation - first.Station) > 0.001
+            || Math.Abs(profile.PVIs[profile.PVIs.Count - 1].RawStation - last.Station) > 0.001)
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
+            $"replaceAll on '{profile.Name}': the old ends ({oldFirst:F4}-{oldLast:F4}) lie outside the new ones ({first.Station:F4}-{last.Station:F4}) and cannot be removed. Nothing was changed.");
+        ordered = ordered.Count > 1 ? ordered.Skip(1).Take(ordered.Count - 2).ToList() : new List<(double, double)>();
+      }
+
+      // C165: a PVI already at the station (1 mm) is a conflict; Civil threw "Value does not fall within the expected
+      // range" (ArgumentException, reported as an internal error; coverage sweep 2026-10-21).
+      foreach (var (station, _) in ordered)
+        for (var i = 0; i < profile.PVIs.Count; i++)
+          if (Math.Abs(profile.PVIs[i].RawStation - station) < 0.001)
+            throw new JsonRpcDispatchException("CIVIL3D.CONFLICT",
+              $"'{profile.Name}' already has a PVI at station {station:F3}; change its elevation, delete it first, or give replaceAll. Nothing was changed.");
+      foreach (var (station, elevation) in ordered)
+      {
+        try
+        {
+          profile.PVIs.AddPVI(station, elevation);
+        }
+        catch (ArgumentException)
+        {
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
+            $"Civil 3D refused a PVI at station {station:F3} on '{profile.Name}' (alignment '{alignment.Name}' runs {alignment.StartingStation:F3}-{alignment.EndingStation:F3}, " +
+            $"profile {profile.StartingStation:F3}-{profile.EndingStation:F3}). Nothing was changed.");
+        }
+      }
+
+      if (list == null)
+      {
+        return new Dictionary<string, object?>
+        {
+          ["alignmentName"] = alignment.Name,
+          ["profileName"] = profile.Name,
+          ["station"] = pvis[0].Station,
+          ["elevation"] = pvis[0].Elevation,
+          ["success"] = true,
+        };
+      }
 
       return new Dictionary<string, object?>
       {
         ["alignmentName"] = alignment.Name,
         ["profileName"] = profile.Name,
-        ["station"] = station,
-        ["elevation"] = elevation,
+        ["removed"] = removed,
+        ["added"] = pvis.Count,
+        ["pviCount"] = profile.PVIs.Count,
         ["success"] = true,
       };
     });
@@ -52,15 +150,29 @@ public static class ProfileEditCommands
       var alignment = CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName);
       var profile = CivilObjectUtils.FindProfileByName(alignment, transaction, profileName, OpenMode.ForWrite);
 
-      var targetPvi = FindPviNearStation(profile.PVIs, station)
-        ?? throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"No PVI found near station {station} in profile '{profileName}'.");
-      profile.PVIs.RemoveAt(targetPvi.RawStation, targetPvi.Elevation);
+      // The nearest PVI used to be removed whatever the distance, so a mistyped station
+      // silently deleted another PVI. Require a match within the tolerance.
+      var tolerance = PluginRuntime.GetOptionalDouble(parameters, "tolerance") ?? 0.01;
+      var targetPvi = FindPviNearStation(profile.PVIs, station);
+      if (targetPvi == null || Math.Abs(targetPvi.RawStation - station) > tolerance)
+      {
+        throw new JsonRpcDispatchException(
+          "CIVIL3D.OBJECT_NOT_FOUND",
+          $"No PVI within {tolerance} m of station {station} in profile '{profileName}'"
+          + (targetPvi == null ? "." : $" (nearest at {targetPvi.RawStation:F3}). Nothing was deleted."));
+      }
+
+      var removedStation = targetPvi.RawStation;
+      var removedElevation = targetPvi.Elevation;
+      profile.PVIs.RemoveAt(removedStation, removedElevation);
 
       return new Dictionary<string, object?>
       {
         ["alignmentName"] = alignment.Name,
         ["profileName"] = profile.Name,
         ["station"] = station,
+        ["removedStation"] = removedStation,
+        ["removedElevation"] = removedElevation,
         ["success"] = true,
       };
     });
@@ -234,36 +346,30 @@ public static class ProfileEditCommands
       var alignment = CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName);
       var insertionPoint = new Point3d(insertX, insertY, 0);
 
-      var blockTable = CivilObjectUtils.GetRequiredObject<BlockTable>(
-        transaction, database.BlockTableId, OpenMode.ForRead);
-      var modelSpace = CivilObjectUtils.GetRequiredObject<BlockTableRecord>(
-        transaction, blockTable[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+      if (TryFindProfileViewByName(civilDoc, transaction, profileViewName) != null)
+      {
+        throw new JsonRpcDispatchException(
+          "CIVIL3D.CONFLICT",
+          $"A profile view named '{profileViewName}' already exists. Nothing was created.");
+      }
 
       var styleId = LookupUtils.GetProfileViewStyleId(
         civilDoc, transaction, PluginRuntime.GetOptionalString(parameters, "style"));
       var bandSetId = LookupUtils.GetProfileViewBandSetId(
         civilDoc, transaction, PluginRuntime.GetOptionalString(parameters, "bandSet"));
 
-      // ProfileView.Create(profileViewName, alignmentId, styleId, insertionPoint)
-      // or ProfileView.Create(profileViewName, alignmentId, insertionPoint, styleId, bandSetId)
-      var profileViewType = typeof(ProfileView);
-      var pvId = (ObjectId?)(
-        CivilObjectUtils.InvokeStaticMethod(profileViewType, "Create",
-          profileViewName, alignment.ObjectId, insertionPoint, styleId, bandSetId)
-        ?? CivilObjectUtils.InvokeStaticMethod(profileViewType, "Create",
-          profileViewName, alignment.ObjectId, styleId, insertionPoint)
-        ?? CivilObjectUtils.InvokeStaticMethod(profileViewType, "Create",
-          profileViewName, alignment.ObjectId, insertionPoint));
-
-      if (pvId == null || pvId.Value.IsNull)
+      // AeccDbMgd 2026: Create(alignmentId, insertPosition, profileViewName, bandSetId, styleId).
+      // The previous reflective calls used argument orders that do not exist and always returned null.
+      var pvId = ProfileView.Create(alignment.ObjectId, insertionPoint, profileViewName, bandSetId, styleId);
+      if (pvId.IsNull)
       {
         throw new JsonRpcDispatchException(
           "CIVIL3D.TRANSACTION_FAILED",
-          "ProfileView.Create returned null — this Civil 3D version may require a different API signature.");
+          $"ProfileView.Create returned a null id for alignment '{alignment.Name}'.");
       }
 
       var profileView = CivilObjectUtils.GetRequiredObject<ProfileView>(
-        transaction, pvId.Value, OpenMode.ForRead);
+        transaction, pvId, OpenMode.ForRead);
 
       return new Dictionary<string, object?>
       {
@@ -272,6 +378,8 @@ public static class ProfileEditCommands
         ["alignmentName"] = alignment.Name,
         ["insertX"] = insertX,
         ["insertY"] = insertY,
+        ["style"] = CivilObjectUtils.GetName(transaction.GetObject(styleId, OpenMode.ForRead)),
+        ["bandSet"] = CivilObjectUtils.GetName(transaction.GetObject(bandSetId, OpenMode.ForRead)),
         ["success"] = true,
       };
     });
@@ -303,9 +411,95 @@ public static class ProfileEditCommands
     });
   }
 
+  // ─── profile view: which profiles are drawn ──────────────────────────────
+
+  public static Task<object?> GetProfileViewProfilesAsync(JsonObject? parameters)
+  {
+    var profileViewName = PluginRuntime.GetRequiredString(parameters, "profileViewName");
+    return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var profileView = FindProfileViewByName(civilDoc, transaction, profileViewName);
+      return new Dictionary<string, object?>
+      {
+        ["profileViewName"] = profileView.Name,
+        ["profiles"] = ListDrawnProfiles(profileView),
+      };
+    });
+  }
+
+  public static Task<object?> SetProfileViewProfilesAsync(JsonObject? parameters)
+  {
+    var profileViewName = PluginRuntime.GetRequiredString(parameters, "profileViewName");
+    if (PluginRuntime.GetParameter(parameters, "draw") is not JsonObject drawNode || drawNode.Count == 0)
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "draw must map at least one profile name to true or false.");
+    }
+
+    var draw = drawNode.ToDictionary(
+      kv => kv.Key,
+      kv => kv.Value?.GetValue<bool>() ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"draw['{kv.Key}'] must be true or false."),
+      StringComparer.OrdinalIgnoreCase);
+
+    return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var found = FindProfileViewByName(civilDoc, transaction, profileViewName);
+      var profileView = CivilObjectUtils.GetRequiredObject<ProfileView>(transaction, found.ObjectId, OpenMode.ForWrite);
+      var available = profileView.GraphOverrides.Select(o => o.ProfileName).ToList();
+      var unknown = draw.Keys.Where(k => !available.Contains(k, StringComparer.OrdinalIgnoreCase)).ToList();
+      if (unknown.Count > 0)
+      {
+        throw new JsonRpcDispatchException(
+          "CIVIL3D.INVALID_INPUT",
+          $"Profile(s) {string.Join(", ", unknown)} are not in profile view '{profileView.Name}'. Available: {string.Join(", ", available)}. Nothing was changed.");
+      }
+
+      foreach (var profileOverride in profileView.GraphOverrides)
+      {
+        if (draw.TryGetValue(profileOverride.ProfileName, out var value))
+        {
+          profileOverride.Draw = value;
+        }
+      }
+
+      var readBack = ListDrawnProfiles(profileView);
+      var notApplied = readBack
+        .Where(p => draw.TryGetValue((string)p["profileName"]!, out var wanted) && (bool)p["draw"]! != wanted)
+        .Select(p => (string)p["profileName"]!)
+        .ToList();
+      if (notApplied.Count > 0)
+      {
+        throw new JsonRpcDispatchException(
+          "CIVIL3D.TRANSACTION_FAILED",
+          $"Draw did not persist for {string.Join(", ", notApplied)} in profile view '{profileView.Name}'.");
+      }
+
+      return new Dictionary<string, object?>
+      {
+        ["profileViewName"] = profileView.Name,
+        ["profiles"] = readBack,
+      };
+    });
+  }
+
+  private static List<Dictionary<string, object?>> ListDrawnProfiles(ProfileView profileView) =>
+    profileView.GraphOverrides
+      .Select(o => new Dictionary<string, object?> { ["profileName"] = o.ProfileName, ["draw"] = o.Draw })
+      .ToList();
+
   // ─── Private helpers ─────────────────────────────────────────────────────
 
-  private static ProfileView FindProfileViewByName(
+  internal static ProfileView FindProfileViewByName(
+    Autodesk.Civil.ApplicationServices.CivilDocument civilDoc,
+    Transaction transaction,
+    string name)
+  {
+    return TryFindProfileViewByName(civilDoc, transaction, name)
+      ?? throw new JsonRpcDispatchException(
+        "CIVIL3D.OBJECT_NOT_FOUND",
+        $"Profile view '{name}' was not found in model space.");
+  }
+
+  private static ProfileView? TryFindProfileViewByName(
     Autodesk.Civil.ApplicationServices.CivilDocument civilDoc,
     Transaction transaction,
     string name)
@@ -327,9 +521,7 @@ public static class ProfileEditCommands
       }
     }
 
-    throw new JsonRpcDispatchException(
-      "CIVIL3D.OBJECT_NOT_FOUND",
-      $"Profile view '{name}' was not found in model space.");
+    return null;
   }
 
   private static ProfilePVI? FindPviNearStation(ProfilePVICollection pvis, double targetStation)

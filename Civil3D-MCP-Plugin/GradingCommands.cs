@@ -24,6 +24,7 @@ public static class GradingCommands
 
   public static Task<object?> ListGradingGroupsAsync()
   {
+    GradingGroupsUnsupported();
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var groups = EnumerateGradingGroups(civilDoc, transaction)
@@ -40,6 +41,7 @@ public static class GradingCommands
 
   public static Task<object?> GetGradingGroupAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var name = PluginRuntime.GetRequiredString(parameters, "name");
 
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
@@ -55,6 +57,7 @@ public static class GradingCommands
 
   public static Task<object?> CreateGradingGroupAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var name = PluginRuntime.GetRequiredString(parameters, "name");
     var description = PluginRuntime.GetOptionalString(parameters, "description") ?? string.Empty;
     var useProjection = PluginRuntime.GetOptionalBool(parameters, "useProjection") ?? false;
@@ -103,6 +106,7 @@ public static class GradingCommands
 
   public static Task<object?> DeleteGradingGroupAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var name = PluginRuntime.GetRequiredString(parameters, "name");
 
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
@@ -124,6 +128,7 @@ public static class GradingCommands
 
   public static Task<object?> GetGradingGroupVolumeAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var name = PluginRuntime.GetRequiredString(parameters, "name");
 
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
@@ -153,6 +158,7 @@ public static class GradingCommands
 
   public static Task<object?> CreateSurfaceFromGradingGroupAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var name = PluginRuntime.GetRequiredString(parameters, "name");
     var surfaceName = PluginRuntime.GetOptionalString(parameters, "surfaceName");
 
@@ -183,6 +189,7 @@ public static class GradingCommands
 
   public static Task<object?> ListGradingsAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var groupName = PluginRuntime.GetRequiredString(parameters, "groupName");
 
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
@@ -206,6 +213,7 @@ public static class GradingCommands
 
   public static Task<object?> GetGradingAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var groupName = PluginRuntime.GetRequiredString(parameters, "groupName");
     var handle = PluginRuntime.GetRequiredString(parameters, "handle");
 
@@ -226,6 +234,7 @@ public static class GradingCommands
 
   public static Task<object?> CreateGradingAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var groupName = PluginRuntime.GetRequiredString(parameters, "groupName");
     var featureLineName = PluginRuntime.GetRequiredString(parameters, "featureLineName");
     var criteriaName = PluginRuntime.GetOptionalString(parameters, "criteriaName");
@@ -266,6 +275,7 @@ public static class GradingCommands
 
   public static Task<object?> DeleteGradingAsync(JsonObject? parameters)
   {
+    GradingGroupsUnsupported();
     var groupName = PluginRuntime.GetRequiredString(parameters, "groupName");
     var handle = PluginRuntime.GetRequiredString(parameters, "handle");
 
@@ -298,18 +308,13 @@ public static class GradingCommands
     {
       var criteriaList = new List<Dictionary<string, object?>>();
 
-      // Try GradingCriteriaSets property path
-      var criteriaSets = Civil3DCompatibility.GetPropertyValue(civilDoc, "GradingCriteriaSets");
-
-      foreach (var setId in CivilObjectUtils.ToObjectIds(criteriaSets))
+      // C162: the criteria sets live under the styles (CivilDocument had no GradingCriteriaSets: the list was always empty)
+      foreach (ObjectId setId in civilDoc.Styles.GradingCriteriaSets)
       {
-        var setObj = transaction.GetObject(setId, OpenMode.ForRead);
-        var setName = CivilObjectUtils.GetName(setObj) ?? string.Empty;
+        var set = (Autodesk.Civil.DatabaseServices.Styles.GradingCriteriaSet)transaction.GetObject(setId, OpenMode.ForRead);
+        var setName = set.Name;
 
-        var criteriaIds = Civil3DCompatibility.GetPropertyValue(setObj, "CriteriaIds")
-          ?? Civil3DCompatibility.GetPropertyValue(setObj, "Criteria");
-
-        foreach (var criteriaId in CivilObjectUtils.ToObjectIds(criteriaIds))
+        foreach (ObjectId criteriaId in set.GradingCriteriaIds())
         {
           var criteriaObj = transaction.GetObject(criteriaId, OpenMode.ForRead);
           criteriaList.Add(new Dictionary<string, object?>
@@ -484,6 +489,15 @@ public static class GradingCommands
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
+
+  /// <summary>C162 (2026-10-21): the .NET API of Civil 3D 2026 has no grading groups (Site has no GradingGroups; grading groups
+  /// are COM only), so these commands could never work: the reads answered with empty lists even in drawings with grading
+  /// groups and createGradingGroup failed with "Add method not found". They now say so before touching the drawing.</summary>
+  private static void GradingGroupsUnsupported() =>
+    throw new JsonRpcDispatchException("CIVIL3D.UNSUPPORTED",
+      $"{PluginRuntime.GetCurrentRequestOperation()}: the Civil 3D 2026 .NET API has no grading groups (they are COM only), so the plugin " +
+      "cannot read or change grading groups and gradings. Feature lines (listFeatureLines, getFeatureLine, createFeatureLine) and " +
+      "grading criteria (listGradingCriteria) work. Nothing was changed.");
 
   private static IEnumerable<DBObject> EnumerateGradingGroups(
     Autodesk.Civil.ApplicationServices.CivilDocument civilDoc,

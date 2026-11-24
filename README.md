@@ -1114,3 +1114,27 @@ Pull requests are welcome. For major changes, open an issue first to discuss wha
 ## License
 
 [MIT](./LICENSE) — Steven Bouldin
+
+---
+
+## Fork additions (civil3d-mcp-va)
+
+This fork of [Sacred-G/Civil3D-mcp](https://github.com/Sacred-G/Civil3D-mcp) (MIT) adds plugin commands for water and wastewater (pipe network) design. All are reached through the existing domain tools or `civil3d_invoke`.
+
+| Command | What it does |
+|---|---|
+| `syncPipeNetwork` | Brings a gravity network to a described state in one transaction, matching parts by name, instead of erasing and rebuilding it (styles, labels and profile-view parts are kept) |
+| `addServiceConnection` | Computes and places a service or gully connection from a host pipe or structure: centred invert, slope, optional knee over a crossing network, trimming and crossing check |
+| `trimPipesToStructures` | Trims pipe ends from structure centres to the structure edges, keeping the grade |
+| `linkNetworkPart` / `getNetworkLinks` | Links a part of one network to a part of another (for example a service to its host pipe) and lists the links |
+| `networkCrossings` | Plan crossings between networks with over/under and vertical clearance, and pipes that pass through structures |
+| `networkFittings` | Fittings per network for quantity lists: bends rounded to standard angles, tees and branches |
+| `applyRealSizeStructureStyles` | Draws structure symbols at their real size in plan through per-size style copies |
+| `gradeGravityNetwork` | Grades a gravity network upstream from the outlet at a given slope |
+| `moveStructures` | Moves structures together with their connected pipe ends |
+| `splitPipe` | Splits a pipe with a new structure, keeping part, size, style and grade |
+| `splitBends` | Splits bends over a maximum angle into several smaller bends |
+| `pipeCoverAlong` | Cover over the crown sampled along each pipe against a surface |
+| `weedProfileViewBandLabels` | Hides overlapping labels in profile view bands (pipe network bands ignore the built-in weeding) |
+| `regenLayouts` | Runs REGENALL on several layouts in one call |
+| `setObjectStyle` `names` | Selects parts by exact name when setting styles |

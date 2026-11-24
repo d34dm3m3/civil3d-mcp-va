@@ -47,6 +47,45 @@ try
     "CIVIL3D.PATH_NOT_ALLOWED",
     () => FileBoundary.ResolveImportPath(Path.Combine(outsideRoot, "outside.dem"), ".dem"));
 
+  // C93/C94: local disks only, reads from the import or export roots, atomic writes through a callback.
+  ExpectCode("CIVIL3D.PATH_NOT_ALLOWED", () => FileBoundary.RequireLocalDisk(@"\\server\share\karta.dwg"));
+  ExpectCode("CIVIL3D.PATH_NOT_ALLOWED", () => FileBoundary.RequireLocalDisk(@"\\?\C:\karta.dwg"));
+  ExpectCode("CIVIL3D.PATH_NOT_ALLOWED", () => FileBoundary.RequireLocalDisk("//server/share/karta.dwg"));
+  FileBoundary.RequireLocalDisk(Path.Combine(allowedRoot, "karta.dwg"));
+  var drawingPath = Path.Combine(allowedRoot, "karta.dwg");
+  File.WriteAllText(drawingPath, "dwg");
+  Assert(FileBoundary.ResolveLocalReadPath(drawingPath, ".dwg") == Path.GetFullPath(drawingPath), "Local read path was rejected.");
+  ExpectCode("CIVIL3D.OBJECT_NOT_FOUND", () => FileBoundary.ResolveLocalReadPath(Path.Combine(allowedRoot, "saknas.dwg"), ".dwg"));
+  ExpectCode("CIVIL3D.PATH_NOT_ALLOWED", () => FileBoundary.ResolveLocalReadPath(Path.Combine(outsideRoot, "karta.dwg"), ".dwg"));
+  Assert(FileBoundary.WriteAccessProblem(drawingPath) == null, "A free file was reported as in use.");
+  using (new FileStream(drawingPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+  {
+    Assert(FileBoundary.WriteAccessProblem(drawingPath) is { } held && held.Contains("another program"), "A file held against writing was not reported.");
+  }
+  File.SetAttributes(drawingPath, FileAttributes.ReadOnly);
+  Assert(FileBoundary.WriteAccessProblem(drawingPath) is { } readOnly && readOnly.Contains("read-only"), "A read-only file was not reported.");
+  File.SetAttributes(drawingPath, FileAttributes.Normal);
+
+  var transformedPath = Path.Combine(allowedRoot, "out", "karta_1330.dwg");
+  var written = FileBoundary.WriteFileAtomic(transformedPath, false, temp =>
+  {
+    Assert(temp.EndsWith(".dwg", StringComparison.OrdinalIgnoreCase) && temp != transformedPath, "Temp file must keep the extension and differ from the target.");
+    File.WriteAllText(temp, "first");
+  }, ".dwg");
+  Assert(File.ReadAllText(written) == "first", "Atomic file write content mismatch.");
+  ExpectCode("CIVIL3D.CONFLICT", () => FileBoundary.WriteFileAtomic(transformedPath, false, temp => File.WriteAllText(temp, "x"), ".dwg"));
+  ExpectCode("CIVIL3D.FILE_IO_ERROR", () => FileBoundary.WriteFileAtomic(transformedPath, true, temp =>
+  {
+    File.WriteAllText(temp, "partial");
+    throw new InvalidOperationException("save failed");
+  }, ".dwg"));
+  Assert(File.ReadAllText(transformedPath) == "first", "A failed atomic write replaced the existing file.");
+  Assert(Directory.EnumerateFiles(Path.GetDirectoryName(transformedPath)!, ".*").Count() == 0, "A failed atomic write left a temp file.");
+  Assert(FileBoundary.ResolveLocalExportPath(Path.Combine(allowedRoot, "ny.dwg"), false, ".dwg") == Path.GetFullPath(Path.Combine(allowedRoot, "ny.dwg")), "Local export path was rejected.");
+  Assert(FileBoundary.SameFile(drawingPath, Path.Combine(allowedRoot, ".", "karta.dwg")), "The same file by another spelling was not recognised.");
+  Assert(!FileBoundary.SameFile(drawingPath, transformedPath), "Two files were taken for one.");
+  Assert(!FileBoundary.SameFile(drawingPath, Path.Combine(allowedRoot, "saknas.dwg")), "A missing file was taken for an existing one.");
+
   var rpcError = JsonNode.Parse(JsonRpcProtocol.SerializeError(
     JsonValue.Create("request-1"),
     JsonRpcProtocol.NumericErrorCode("CIVIL3D.OBJECT_NOT_FOUND"),
@@ -157,7 +196,47 @@ try
     responseServer.Stop();
   }
 
-  Console.WriteLine("P1 disconnect cancellation, P2 filesystem/JSON-RPC, and P4 bounded-job checks passed.");
+  // C93: a step registered by the request runs only after the answer was written (and is told when it was not).
+  var answerPort = GetFreeTcpPort();
+  var stepRan = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+  var answerServer = new RpcTcpServer(answerPort, (request, _) =>
+  {
+    var scope = AnswerScope.Current!;
+    Assert(scope.TryRegister(written => stepRan.TrySetResult(written)), "The first step was not registered.");
+    Assert(!scope.TryRegister(_ => { }), "A second step was registered.");
+    if (!request.Contains("error")) scope.MarkResult();
+    return Task.FromResult("{\"closing\":true}");
+  });
+  answerServer.Start();
+  try
+  {
+    using (var answerClient = new TcpClient())
+    {
+      await answerClient.ConnectAsync(IPAddress.Loopback, answerPort);
+      await answerClient.GetStream().WriteAsync(Encoding.UTF8.GetBytes("{\"jsonrpc\":\"2.0\",\"method\":\"close\",\"id\":\"answer-test\"}"));
+      var answerBuffer = new byte[128];
+      var answerLength = await answerClient.GetStream().ReadAsync(answerBuffer).AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+      Assert(Encoding.UTF8.GetString(answerBuffer, 0, answerLength) == "{\"closing\":true}", "The answer did not arrive.");
+    }
+    Assert(await stepRan.Task.WaitAsync(TimeSpan.FromSeconds(3)), "The step after a written result was not told it was written.");
+
+    stepRan = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using (var errorClient = new TcpClient())
+    {
+      await errorClient.ConnectAsync(IPAddress.Loopback, answerPort);
+      await errorClient.GetStream().WriteAsync(Encoding.UTF8.GetBytes("{\"jsonrpc\":\"2.0\",\"method\":\"error\",\"id\":\"answer-error\"}"));
+      var errorBuffer = new byte[128];
+      await errorClient.GetStream().ReadAsync(errorBuffer).AsTask().WaitAsync(TimeSpan.FromSeconds(3));
+    }
+    Assert(!await stepRan.Task.WaitAsync(TimeSpan.FromSeconds(3)), "The step after an error answer was told it was written.");
+  }
+  finally
+  {
+    answerServer.Stop();
+  }
+  Assert(AnswerScope.Current == null, "An answer scope leaked out of the request.");
+
+  Console.WriteLine("P1 disconnect cancellation, P2 filesystem/JSON-RPC, P4 bounded-job and C93 answer-scope checks passed.");
 }
 finally
 {

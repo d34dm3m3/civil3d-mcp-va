@@ -29,6 +29,9 @@ const CorridorRegionSchema = z.object({
   startStation: z.number(),
   endStation: z.number(),
   frequency: z.number(),
+  frequencyAtCurves: z.number().optional(),
+  frequencyAlongProfileCurves: z.number().optional(),
+  appliedAtProfileGeometryPoints: z.boolean().optional(),
 });
 
 const CorridorBaselineSchema = z.object({
@@ -61,9 +64,22 @@ const CorridorSurfacesResponseSchema = z.object({
 
 const CorridorFeatureLineSchema = z.record(z.unknown());
 
+// with includeGeometry (C60): 3D points per feature line of the main baselines, side by the median offset
+const CorridorFeatureLineGeometrySchema = z.object({
+  baseline: z.string(),
+  code: z.string(),
+  side: z.enum(["left", "right", "center"]),
+  medianOffset: z.number(),
+  startStation: z.number(),
+  endStation: z.number(),
+  points: z.array(z.array(z.number()).length(3)),
+});
+
 const CorridorFeatureLinesResponseSchema = z.object({
   corridorName: z.string().optional(),
   featureLines: z.array(CorridorFeatureLineSchema),
+  lines: z.array(CorridorFeatureLineGeometrySchema).optional(),
+  diagnostics: z.array(z.object({ baseline: z.string(), code: z.string(), featureLines: z.number(), points: z.number() })).optional(),
 });
 
 // The plugin now returns {jobId, state:"running", message} and completes the
@@ -124,6 +140,9 @@ const CorridorGetSurfacesArgsSchema = z.object({
 const CorridorGetFeatureLinesArgsSchema = z.object({
   action: z.literal("get_feature_lines"),
   name: z.string(),
+  includeGeometry: z.boolean().optional(),
+  codes: z.array(z.string()).optional(),
+  decimals: z.number().int().min(0).max(6).optional(),
 });
 
 const CorridorComputeVolumesArgsSchema = z.object({
@@ -147,16 +166,52 @@ const CorridorTargetMappingGetArgsSchema = z.object({
   baselineIndex: z.number().int().nonnegative().optional(),
 });
 
+// A target row is matched against SubassemblyTargetInfo.LogicalName or
+// DisplayName (optionally narrowed to one subassembly) and receives the
+// object named targetName as its TargetIds.
+const CorridorTargetRowShape = {
+  logicalName: z.string().optional(),
+  displayName: z.string().optional(),
+  subassemblyName: z.string().optional(),
+  targetType: z.enum(["surface", "alignment", "profile", "polyline"]),
+  targetName: z.string(),
+};
+
+const CorridorTargetRowSchema = z.object(CorridorTargetRowShape).refine(
+  (row) => Boolean(row.logicalName || row.displayName),
+  { message: "Each target needs logicalName or displayName (see target_mapping_get)." },
+);
+
+const CorridorTargetScopeSchema = z.enum(["region", "baseline", "corridor"]);
+
 const CorridorTargetMappingSetArgsSchema = z.object({
   action: z.literal("target_mapping_set"),
   name: z.string(),
+  scope: CorridorTargetScopeSchema.optional(),
   regionIndex: z.number().int().nonnegative().optional(),
   baselineIndex: z.number().int().nonnegative().optional(),
-  targets: z.array(z.object({
-    parameterName: z.string(),
-    targetType: z.enum(["surface", "alignment", "profile", "polyline"]),
-    targetName: z.string(),
-  })),
+  targets: z.array(CorridorTargetRowSchema).min(1),
+  rebuild: z.boolean().optional(),
+});
+
+const CorridorFrequencyShape = {
+  frequency: z.number().positive().optional(),
+  frequencyAtCurves: z.number().positive().optional(),
+  frequencyAlongProfileCurves: z.number().positive().optional(),
+  appliedAtProfileGeometryPoints: z.boolean().optional(),
+};
+
+const CorridorCreateArgsSchema = z.object({
+  action: z.literal("create"),
+  name: z.string(),
+  alignmentName: z.string(),
+  profileName: z.string(),
+  assemblyName: z.string(),
+  baselineName: z.string().optional(),
+  regionName: z.string().optional(),
+  startStation: z.number().optional(),
+  endStation: z.number().optional(),
+  ...CorridorFrequencyShape,
 });
 
 const CorridorRegionAddArgsSchema = z.object({
@@ -164,11 +219,35 @@ const CorridorRegionAddArgsSchema = z.object({
   name: z.string(),
   baselineIndex: z.number().int().nonnegative().optional(),
   assemblyName: z.string(),
+  regionName: z.string().optional(),
   startStation: z.number(),
   endStation: z.number(),
-  frequency: z.number().positive().optional(),
-  frequencyAtCurves: z.number().positive().optional(),
-  frequencyAtKneePoints: z.number().positive().optional(),
+  ...CorridorFrequencyShape,
+  // Not a Civil 3D AppliedAssemblySetting property; rejected instead of ignored.
+  frequencyAtKneePoints: z.never().optional(),
+  rebuild: z.boolean().optional(),
+});
+
+const CorridorRegionEditArgsSchema = z.object({
+  action: z.literal("region_edit"),
+  name: z.string(),
+  baselineIndex: z.number().int().nonnegative().optional(),
+  regionIndex: z.number().int().nonnegative(),
+  regionName: z.string().optional(),
+  assemblyName: z.string().optional(),
+  startStation: z.number().optional(),
+  endStation: z.number().optional(),
+  ...CorridorFrequencyShape,
+  rebuild: z.boolean().optional(),
+});
+
+const CorridorRegionSplitArgsSchema = z.object({
+  action: z.literal("region_split"),
+  name: z.string(),
+  baselineIndex: z.number().int().nonnegative().optional(),
+  regionIndex: z.number().int().nonnegative(),
+  station: z.number(),
+  rebuild: z.boolean().optional(),
 });
 
 const CorridorRegionDeleteArgsSchema = z.object({
@@ -176,6 +255,47 @@ const CorridorRegionDeleteArgsSchema = z.object({
   name: z.string(),
   baselineIndex: z.number().int().nonnegative().optional(),
   regionIndex: z.number().int().nonnegative(),
+});
+
+const CorridorOverhangSchema = z.enum(["none", "top_links", "bottom_links"]);
+
+const CorridorSurfaceCreateArgsSchema = z.object({
+  action: z.literal("surface_create"),
+  name: z.string(),
+  surfaceName: z.string(),
+  linkCodes: z.array(z.string()).min(1),
+  addAsBreakline: z.boolean().optional(),
+  boundaryFromExtents: z.boolean().optional(),
+  overhangCorrection: CorridorOverhangSchema.optional(),
+});
+
+const CorridorBoundaryPointSchema = z.object({ x: z.number(), y: z.number() });
+
+const CorridorSurfaceBoundaryAddArgsSchema = z.object({
+  action: z.literal("surface_boundary_add"),
+  name: z.string(),
+  surfaceName: z.string(),
+  boundaryName: z.string(),
+  boundaryType: z.enum(["outside", "inside"]).optional(),
+  points: z.array(CorridorBoundaryPointSchema).min(3),
+  replace: z.boolean().optional(),
+});
+
+const CorridorDeleteArgsSchema = z.object({
+  action: z.literal("delete"),
+  name: z.string(),
+});
+
+const CorridorQuantitiesArgsSchema = z.object({
+  action: z.literal("quantities"),
+  name: z.string(),
+  baselineIndex: z.number().int().nonnegative().optional(),
+  startStation: z.number().optional(),
+  endStation: z.number().optional(),
+  shapeCodes: z.array(z.string()).optional(),
+  bottomCode: z.string().optional(),
+  daylightCode: z.string().optional(),
+  includeRows: z.boolean().optional(),
 });
 
 // ─── Canonical input shape ────────────────────────────────────────────────────
@@ -192,24 +312,48 @@ const canonicalCorridorInputShape = {
     "target_mapping_get",
     "target_mapping_set",
     "region_add",
+    "region_edit",
+    "region_split",
     "region_delete",
+    "create",
+    "delete",
+    "surface_create",
+    "surface_boundary_add",
+    "quantities",
   ]),
   name: z.string().optional(),
+  includeGeometry: z.boolean().optional(),
+  codes: z.array(z.string()).optional(),
+  decimals: z.number().int().min(0).max(6).optional(),
   corridorSurface: z.string().optional(),
   referenceSurface: z.string().optional(),
   regionIndex: z.number().int().nonnegative().optional(),
   baselineIndex: z.number().int().nonnegative().optional(),
-  targets: z.array(z.object({
-    parameterName: z.string(),
-    targetType: z.enum(["surface", "alignment", "profile", "polyline"]),
-    targetName: z.string(),
-  })).optional(),
+  scope: CorridorTargetScopeSchema.optional(),
+  targets: z.array(z.object(CorridorTargetRowShape)).optional(),
+  alignmentName: z.string().optional(),
+  profileName: z.string().optional(),
   assemblyName: z.string().optional(),
+  baselineName: z.string().optional(),
+  regionName: z.string().optional(),
   startStation: z.number().optional(),
   endStation: z.number().optional(),
-  frequency: z.number().positive().optional(),
-  frequencyAtCurves: z.number().positive().optional(),
-  frequencyAtKneePoints: z.number().positive().optional(),
+  station: z.number().optional(),
+  ...CorridorFrequencyShape,
+  rebuild: z.boolean().optional(),
+  surfaceName: z.string().optional(),
+  linkCodes: z.array(z.string()).optional(),
+  addAsBreakline: z.boolean().optional(),
+  boundaryFromExtents: z.boolean().optional(),
+  overhangCorrection: CorridorOverhangSchema.optional(),
+  boundaryName: z.string().optional(),
+  boundaryType: z.enum(["outside", "inside"]).optional(),
+  points: z.array(CorridorBoundaryPointSchema).optional(),
+  replace: z.boolean().optional(),
+  shapeCodes: z.array(z.string()).optional(),
+  bottomCode: z.string().optional(),
+  daylightCode: z.string().optional(),
+  includeRows: z.boolean().optional(),
 };
 
 // ─── Domain definition ────────────────────────────────────────────────────────
@@ -282,6 +426,9 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
       execute: async (args) => await withApplicationConnection(
         async (appClient) => await appClient.sendCommand("getCorridorFeatureLines", {
           name: args.name,
+          includeGeometry: args.includeGeometry ?? false,
+          codes: args.codes ?? null,
+          decimals: args.decimals ?? 3,
         }),
       ),
     },
@@ -389,12 +536,47 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
       requiresActiveDrawing: true,
       safeForRetry: false,
       pluginMethods: ["setCorridorTargetMappings"],
-      execute: async (args) => await withApplicationConnection(
-        async (appClient) => await appClient.sendCommand("setCorridorTargetMappings", {
+      execute: async (args) => await withApplicationConnection(async (appClient) => {
+        const scope = (args.scope as string | undefined) ?? "region";
+        const targets = (args.targets as Array<Record<string, unknown>>).map((row) => ({
+          logicalName: row.logicalName ?? null,
+          displayName: row.displayName ?? null,
+          subassemblyName: row.subassemblyName ?? null,
+          targetType: row.targetType,
+          targetName: row.targetName,
+        }));
+        return await appClient.sendCommand("setCorridorTargetMappings", {
           corridorName: args.name,
-          regionIndex: args.regionIndex ?? 0,
+          scope,
           baselineIndex: args.baselineIndex ?? 0,
-          targets: args.targets,
+          regionIndex: scope === "region" ? (args.regionIndex ?? 0) : null,
+          targets,
+          rebuild: args.rebuild ?? true,
+        });
+      }),
+    },
+    create: {
+      action: "create",
+      inputSchema: CorridorCreateArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["create"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["createCorridor"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("createCorridor", {
+          name: args.name,
+          alignmentName: args.alignmentName,
+          profileName: args.profileName,
+          assemblyName: args.assemblyName,
+          baselineName: args.baselineName ?? null,
+          regionName: args.regionName ?? null,
+          startStation: args.startStation ?? null,
+          endStation: args.endStation ?? null,
+          frequency: args.frequency ?? null,
+          frequencyAtCurves: args.frequencyAtCurves ?? null,
+          frequencyAlongProfileCurves: args.frequencyAlongProfileCurves ?? null,
+          appliedAtProfileGeometryPoints: args.appliedAtProfileGeometryPoints ?? null,
         }),
       ),
     },
@@ -411,12 +593,129 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
           corridorName: args.name,
           baselineIndex: args.baselineIndex ?? 0,
           assemblyName: args.assemblyName,
+          regionName: args.regionName ?? null,
           startStation: args.startStation,
           endStation: args.endStation,
-          frequency: args.frequency ?? 10,
+          frequency: args.frequency ?? null,
           frequencyAtCurves: args.frequencyAtCurves ?? null,
-          frequencyAtKneePoints: args.frequencyAtKneePoints ?? null,
+          frequencyAlongProfileCurves: args.frequencyAlongProfileCurves ?? null,
+          appliedAtProfileGeometryPoints: args.appliedAtProfileGeometryPoints ?? null,
+          rebuild: args.rebuild ?? true,
         }),
+      ),
+    },
+    region_edit: {
+      action: "region_edit",
+      inputSchema: CorridorRegionEditArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["editCorridorRegion"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("editCorridorRegion", {
+          corridorName: args.name,
+          baselineIndex: args.baselineIndex ?? 0,
+          regionIndex: args.regionIndex,
+          regionName: args.regionName ?? null,
+          assemblyName: args.assemblyName ?? null,
+          startStation: args.startStation ?? null,
+          endStation: args.endStation ?? null,
+          frequency: args.frequency ?? null,
+          frequencyAtCurves: args.frequencyAtCurves ?? null,
+          frequencyAlongProfileCurves: args.frequencyAlongProfileCurves ?? null,
+          appliedAtProfileGeometryPoints: args.appliedAtProfileGeometryPoints ?? null,
+          rebuild: args.rebuild ?? true,
+        }),
+      ),
+    },
+    region_split: {
+      action: "region_split",
+      inputSchema: CorridorRegionSplitArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["splitCorridorRegion"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("splitCorridorRegion", {
+          corridorName: args.name,
+          baselineIndex: args.baselineIndex ?? 0,
+          regionIndex: args.regionIndex,
+          station: args.station,
+          rebuild: args.rebuild ?? true,
+        }),
+      ),
+    },
+    surface_create: {
+      action: "surface_create",
+      inputSchema: CorridorSurfaceCreateArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["create"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["createCorridorSurface"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("createCorridorSurface", {
+          corridorName: args.name,
+          surfaceName: args.surfaceName,
+          linkCodes: args.linkCodes,
+          addAsBreakline: args.addAsBreakline ?? true,
+          boundaryFromExtents: args.boundaryFromExtents ?? true,
+          overhangCorrection: args.overhangCorrection ?? null,
+        }),
+      ),
+    },
+    surface_boundary_add: {
+      action: "surface_boundary_add",
+      inputSchema: CorridorSurfaceBoundaryAddArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["addCorridorSurfaceBoundary"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("addCorridorSurfaceBoundary", {
+          corridorName: args.name,
+          surfaceName: args.surfaceName,
+          boundaryName: args.boundaryName,
+          boundaryType: args.boundaryType ?? "outside",
+          points: args.points,
+          replace: args.replace ?? false,
+        }),
+      ),
+    },
+    quantities: {
+      action: "quantities",
+      inputSchema: CorridorQuantitiesArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["analyze"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["corridorQuantities"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("corridorQuantities", {
+          corridorName: args.name,
+          baselineIndex: args.baselineIndex ?? 0,
+          startStation: args.startStation ?? null,
+          endStation: args.endStation ?? null,
+          shapeCodes: args.shapeCodes ?? null,
+          bottomCode: args.bottomCode ?? "Trench_Bottom",
+          daylightCode: args.daylightCode ?? "Trench_Daylight",
+          includeRows: args.includeRows ?? false,
+        }),
+      ),
+    },
+    delete: {
+      action: "delete",
+      inputSchema: CorridorDeleteArgsSchema,
+      responseSchema: GenericCorridorResponseSchema,
+      capabilities: ["delete"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["deleteCorridor"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("deleteCorridor", { corridorName: args.name }),
       ),
     },
     region_delete: {
@@ -440,7 +739,7 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
     {
       toolName: "civil3d_corridor",
       displayName: "Civil 3D Corridor",
-      description: "Reads Civil 3D corridor data, controls rebuild, computes volumes, and manages regions and target mappings through a single domain tool.",
+      description: "Creates and reads Civil 3D corridors, controls rebuild, manages regions, target mappings and corridor surfaces, and reports per-station quantities through a single domain tool.",
       inputShape: canonicalCorridorInputShape,
       supportedActions: [
         "list",
@@ -453,7 +752,14 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
         "target_mapping_get",
         "target_mapping_set",
         "region_add",
+        "region_edit",
+        "region_split",
         "region_delete",
+        "create",
+        "delete",
+        "surface_create",
+        "surface_boundary_add",
+        "quantities",
       ],
       resolveAction: (rawArgs) => ({
         action: String(rawArgs.action ?? ""),
@@ -503,16 +809,14 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
     {
       toolName: "civil3d_corridor_target_mapping_set",
       displayName: "Civil 3D Corridor Target Mapping Set",
-      description: "Set or update subassembly target mappings on a Civil 3D corridor region. Assigns surfaces, alignments, profiles, or polylines as targets for subassembly parameters.",
+      description: "Set subassembly target mappings on a Civil 3D corridor region, baseline, or whole corridor. Targets are matched by logicalName or displayName from target_mapping_get.",
       inputShape: {
         corridorName: z.string(),
+        scope: CorridorTargetScopeSchema.optional(),
         regionIndex: z.number().int().nonnegative().optional(),
         baselineIndex: z.number().int().nonnegative().optional(),
-        targets: z.array(z.object({
-          parameterName: z.string(),
-          targetType: z.enum(["surface", "alignment", "profile", "polyline"]),
-          targetName: z.string(),
-        })),
+        targets: z.array(z.object(CorridorTargetRowShape)),
+        rebuild: z.boolean().optional(),
       },
       supportedActions: ["target_mapping_set"],
       resolveAction: (rawArgs) => ({
@@ -520,9 +824,11 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
         args: {
           action: "target_mapping_set",
           name: rawArgs.corridorName,
+          scope: rawArgs.scope,
           regionIndex: rawArgs.regionIndex,
           baselineIndex: rawArgs.baselineIndex,
           targets: rawArgs.targets,
+          rebuild: rawArgs.rebuild,
         },
       }),
     },
@@ -534,11 +840,11 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
         corridorName: z.string(),
         baselineIndex: z.number().int().nonnegative().optional(),
         assemblyName: z.string(),
+        regionName: z.string().optional(),
         startStation: z.number(),
         endStation: z.number(),
-        frequency: z.number().positive().optional(),
-        frequencyAtCurves: z.number().positive().optional(),
-        frequencyAtKneePoints: z.number().positive().optional(),
+        ...CorridorFrequencyShape,
+        rebuild: z.boolean().optional(),
       },
       supportedActions: ["region_add"],
       resolveAction: (rawArgs) => ({
@@ -548,11 +854,14 @@ export const CORRIDOR_DOMAIN_DEFINITION: DomainToolDefinition = {
           name: rawArgs.corridorName,
           baselineIndex: rawArgs.baselineIndex,
           assemblyName: rawArgs.assemblyName,
+          regionName: rawArgs.regionName,
           startStation: rawArgs.startStation,
           endStation: rawArgs.endStation,
           frequency: rawArgs.frequency,
           frequencyAtCurves: rawArgs.frequencyAtCurves,
-          frequencyAtKneePoints: rawArgs.frequencyAtKneePoints,
+          frequencyAlongProfileCurves: rawArgs.frequencyAlongProfileCurves,
+          appliedAtProfileGeometryPoints: rawArgs.appliedAtProfileGeometryPoints,
+          rebuild: rawArgs.rebuild,
         },
       }),
     },

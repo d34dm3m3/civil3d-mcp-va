@@ -149,7 +149,7 @@ public static class QuantityCommands
       foreach (var pipeId in GetChildObjectIds(networkObj, "GetPipeIds", "PipeIds", "Pipes"))
       {
         var pipe = transaction.GetObject(pipeId, OpenMode.ForRead);
-        var length = GetRequiredEngineeringDouble(pipe, $"pressure pipe '{CivilObjectUtils.GetName(pipe)}' length", "Length3D", "Length2D", "Length");
+        var length = GetRequiredEngineeringDouble(pipe, $"pressure pipe '{CivilObjectUtils.GetName(pipe)}' length", "Length3DCenterToCenter", "Length3D", "Length2DCenterToCenter", "Length2D", "Length");   // C164: pressure pipes have *CenterToCenter
         var diameter = GetRequiredEngineeringDouble(pipe, $"pressure pipe '{CivilObjectUtils.GetName(pipe)}' diameter", "InnerDiameter", "OuterDiameter", "Diameter", "InnerDiameterOrWidth");
         var material = GetAnyString(pipe, "Material", "PipeFamily", "PartFamilyName", "PartDescription") ?? "Unknown";
 
@@ -414,7 +414,7 @@ public static class QuantityCommands
           {
             var pipe = transaction.GetObject(pipeId, OpenMode.ForRead);
             var pipeName = CivilObjectUtils.GetName(pipe) ?? pipeId.Handle.ToString();
-            var length = GetRequiredEngineeringDouble(pipe, $"pipe '{pipeName}' length", "Length3D", "Length2D", "Length");
+            var length = GetRequiredEngineeringDouble(pipe, $"pipe '{pipeName}' length", "Length3DCenterToCenter", "Length3D", "Length2DCenterToCenter", "Length2D", "Length");   // C164: pressure pipes have *CenterToCenter
             var diameter = GetRequiredEngineeringDouble(pipe, $"pipe '{pipeName}' diameter", "InnerDiameterOrWidth", "InnerDiameter", "Diameter");
             var slope = GetRequiredEngineeringDouble(pipe, $"pipe '{pipeName}' slope", "Slope", "FlowSlope");
             var material = GetAnyString(pipe, "Material", "PartDescription", "PartFamilyName") ?? string.Empty;

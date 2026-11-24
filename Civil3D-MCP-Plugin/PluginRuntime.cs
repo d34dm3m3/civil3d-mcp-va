@@ -34,6 +34,9 @@ public static class PluginRuntime
   private static readonly AsyncLocal<string?> CurrentRequestId = new();
   private static readonly AsyncLocal<CancellationToken> CurrentRequestCancellation = new();
   private static readonly AsyncLocal<string?> CurrentExpectedDrawingIdentity = new();
+  // C150: the drawing the caller says it writes to (params.expectDrawing: file name or full path), checked against the
+  // active drawing when the call runs; a batch's value applies to every call in it.
+  private static readonly AsyncLocal<string?> CurrentRequestedDrawing = new();
   private const int MaxQueuedHostOperations = 64;
   private static int _queueDepth;
   private static int _activeOperations;
@@ -128,9 +131,13 @@ public static class PluginRuntime
     var previousOperation = CurrentRequestOperation.Value;
     var previousRequestId = CurrentRequestId.Value;
     var previousCancellation = CurrentRequestCancellation.Value;
+    var previousRequestedDrawing = CurrentRequestedDrawing.Value;
     CurrentRequestOperation.Value = method;
     CurrentRequestId.Value = id?.ToJsonString();
     CurrentRequestCancellation.Value = cancellationToken;
+    if (parameters?["expectDrawing"] is JsonValue expectValue && expectValue.TryGetValue<string>(out var expectText)
+        && !string.IsNullOrWhiteSpace(expectText))
+      CurrentRequestedDrawing.Value = expectText.Trim();
 
     var timer = System.Diagnostics.Stopwatch.StartNew();
     try
@@ -138,7 +145,9 @@ public static class PluginRuntime
       PluginLog.Debug("Dispatch", $"-> {method} [{CurrentRequestId.Value ?? "no-id"}]");
       var result = await CommandDispatcher.DispatchAsync(method, parameters, cancellationToken);
       PluginLog.Debug("Dispatch", $"<- {method} [{CurrentRequestId.Value ?? "no-id"}] ok durationMs={timer.ElapsedMilliseconds}");
-      return JsonRpcProtocol.SerializeResult(id, result);
+      var answer = JsonRpcProtocol.SerializeResult(id, result);
+      AnswerScope.Current?.MarkResult();                // C93: a step waiting for the answer runs only after a result
+      return answer;
     }
     catch (JsonRpcDispatchException ex)
     {
@@ -155,10 +164,14 @@ public static class PluginRuntime
     catch (Exception ex)
     {
       PluginLog.Error("Dispatch", $"<- {method} [{CurrentRequestId.Value ?? "no-id"}] unhandled failure durationMs={timer.ElapsedMilliseconds} category={ex.GetType().Name}", ex);
-      return JsonRpcProtocol.SerializeError(id, -32603, "CIVIL3D.INTERNAL_ERROR", "The Civil 3D plugin encountered an unexpected error.");
+      // C149: the exception's type and message go back to the caller (was a fixed text; the cause was only in the log).
+      // C163: exceptions that are the caller's input or the drawing's state get that class, not INTERNAL_ERROR.
+      var (code, number) = ClassifyUnhandled(ex);
+      return JsonRpcProtocol.SerializeError(id, number, code, $"{method}: {(code == "CIVIL3D.INTERNAL_ERROR" ? "unexpected " : "")}{DescribeException(ex)}");
     }
     finally
     {
+      CurrentRequestedDrawing.Value = previousRequestedDrawing;
       CurrentRequestOperation.Value = previousOperation;
       CurrentRequestId.Value = previousRequestId;
       CurrentRequestCancellation.Value = previousCancellation;
@@ -171,6 +184,68 @@ public static class PluginRuntime
 
   internal static string? GetCurrentRequestId() => CurrentRequestId.Value;
 
+  /// <summary>C149: "type: message" of an unhandled exception, with AutoCAD's ErrorStatus and the innermost cause.</summary>
+  internal static string DescribeException(Exception ex)
+  {
+    var root = Civil3DCompatibility.UnwrapInvocation(ex);
+    var text = $"{root.GetType().Name}: {root.Message}";
+    if (root is Autodesk.AutoCAD.Runtime.Exception acad) text += $" (ErrorStatus {acad.ErrorStatus})";
+    if (root.InnerException != null && root.InnerException.Message != root.Message)
+      text += $" <- {root.InnerException.GetType().Name}: {root.InnerException.Message}";
+    return text.Length > 600 ? text[..600] : text;
+  }
+
+  /// <summary>C150: the caller's expectDrawing with the operation name, read on the request's thread (the main thread
+  /// running the call later does not carry the request's AsyncLocals).</summary>
+  /// <summary>C163 (2026-10-21): the class of an exception a command did not handle. A parameter of the wrong JSON type
+  /// (JsonNode GetValue) is invalid input; a name that exists already is a conflict; a missing referenced object (null
+  /// object id, key not found) is "not found"; everything else stays an internal error. Found by the coverage sweep:
+  /// createLayoutProfile with an existing name, setScale with a number, setMLeaderStyle with an unknown style.</summary>
+  internal static (string Code, int Number) ClassifyUnhandled(Exception ex)
+  {
+    var root = Civil3DCompatibility.UnwrapInvocation(ex);
+    var text = root.Message ?? "";
+    if (root is InvalidOperationException && text.Contains("cannot be converted to", StringComparison.OrdinalIgnoreCase)
+        || root is FormatException
+        || root.GetType() == typeof(ArgumentException) && text.Contains("expected range", StringComparison.OrdinalIgnoreCase))   // E_INVALIDARG from Civil
+      return ("CIVIL3D.INVALID_INPUT", -32602);
+    if (text.Contains("already exist", StringComparison.OrdinalIgnoreCase)
+        || root is Autodesk.AutoCAD.Runtime.Exception { ErrorStatus: Autodesk.AutoCAD.Runtime.ErrorStatus.DuplicateRecordName or Autodesk.AutoCAD.Runtime.ErrorStatus.DuplicateKey })
+      return ("CIVIL3D.CONFLICT", -32009);
+    if (root is KeyNotFoundException
+        || root is Autodesk.AutoCAD.Runtime.Exception { ErrorStatus: Autodesk.AutoCAD.Runtime.ErrorStatus.NullObjectId or Autodesk.AutoCAD.Runtime.ErrorStatus.KeyNotFound })
+      return ("CIVIL3D.OBJECT_NOT_FOUND", -32004);
+    return ("CIVIL3D.INTERNAL_ERROR", -32603);
+  }
+
+  /// <summary>C150: sets the expectDrawing of the calls that follow on this thread (a batch's calls); returns the previous.</summary>
+  internal static string? SetRequestedDrawing(string? name)
+  {
+    var previous = CurrentRequestedDrawing.Value;
+    CurrentRequestedDrawing.Value = name;
+    return previous;
+  }
+
+  internal static (string? Name, string Operation) GetRequestedDrawing() => (CurrentRequestedDrawing.Value, GetCurrentRequestOperation());
+
+  /// <summary>C150: refuses the call when the caller named a drawing (expectDrawing) and another one is active. The
+  /// name matches the active drawing's full path, its file name (with or without .dwg) or the document name
+  /// (Drawing1.dwg for a drawing never saved).</summary>
+  internal static void CheckRequestedDrawing(Autodesk.AutoCAD.ApplicationServices.Document doc, (string? Name, string Operation) request)
+  {
+    var requested = request.Name;
+    if (string.IsNullOrWhiteSpace(requested)) return;
+    var identity = GetDrawingIdentity(doc) ?? doc.Name;
+    var want = requested.Replace('/', Path.DirectorySeparatorChar).Trim();
+    bool Same(string? have) => !string.IsNullOrWhiteSpace(have)
+      && (string.Equals(have, want, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(Path.GetFileName(have), want, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(Path.GetFileNameWithoutExtension(have), want, StringComparison.OrdinalIgnoreCase));
+    if (Same(identity) || Same(doc.Name)) return;
+    throw new JsonRpcDispatchException("CIVIL3D.WRONG_DRAWING",
+      $"{request.Operation}: expectDrawing is '{requested}' but the active drawing is '{identity}'. Nothing was changed.");
+  }
+
   internal static string? GetActiveDrawingIdentity()
   {
     var document = App.DocumentManager.MdiActiveDocument;
@@ -180,7 +255,9 @@ public static class PluginRuntime
   internal static string? GetDrawingIdentity(Autodesk.AutoCAD.ApplicationServices.Document? document)
   {
     if (document == null) return null;
-    var fileName = document.Database.Filename;
+    // C93: a drawing never saved has no file of its own; its Database.Filename may name the template it came from, which
+    // can be open beside it (company template + new project drawing), so the document name (Drawing1.dwg) identifies it.
+    var fileName = document.IsNamedDrawing ? document.Database.Filename : null;
     return string.IsNullOrWhiteSpace(fileName) ? document.Name : fileName;
   }
 

@@ -90,3 +90,27 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+
+# standalone check build output
+tools/quantitymath_check/out/
+tools/gapmath_check/out/
+tools/compat_check/out/
+tools/gridcrossmath_check/out/
+tools/bendanglemath_check/out/
+tools/drawingtransformmath_check/out/
+
+# live test report (C152)
+tests/live/senaste.json
+tests/live/tackning.json
+
+# local tooling and drawing data (never published)
+tools/apidump_tmp/
+C_References/
+*.dwg
+*.dwt
+*.dxf
+*.bak
+*.sv$
+.mcp.json
+bridge.token
+*.kdbx

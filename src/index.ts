@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools/register.js";
 import { startHttpBridge } from "./httpBridge.js";
+import { bridgeTokenFile, newBridgeToken, writeBridgeToken } from "./utils/bridgeToken.js";
 import { createLogger } from "./utils/logger.js";
 import { APP_VERSION } from "./version.js";
 
@@ -14,7 +15,20 @@ const server = new McpServer({
 
 async function main() {
   await registerTools(server);
-  const httpServer = startHttpBridge();
+  // C65: a new bridge token per start, in the user's profile (see utils/bridgeToken.ts)
+  const tokenFile = bridgeTokenFile();
+  const token = tokenFile ? newBridgeToken() : undefined;
+  const httpServer = startHttpBridge(token ? { authToken: token } : {});
+  if (token && tokenFile) {
+    httpServer.once("listening", () => {
+      try {
+        writeBridgeToken(tokenFile, token);
+        log.info("HTTP bridge token written", { file: tokenFile });
+      } catch (error) {
+        log.warn("HTTP bridge token could not be written; local clients will get 401", { file: tokenFile, error: String(error) });
+      }
+    });
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

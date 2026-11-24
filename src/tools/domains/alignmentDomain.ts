@@ -55,13 +55,22 @@ const AlignmentStationToPointResponseSchema = z.object({
   station: z.number(),
   offset: z.number(),
   units: z.string(),
+  stationMode: z.enum(["raw", "nominal"]).optional(),
+  rawStation: z.number().optional(),
+  stationWithEquations: z.string().nullable().optional(),
 });
 
+// C101 (point_to_station): outOfRange = the point lies beyond the alignment's start or end (the end station is given, with a
+// warning); equallyNearStations when several stations are equally near (within 1 mm; the station given is their mean when
+// they lie close together, as inside an angle point, else the first).
 const AlignmentPointToStationResponseSchema = z.object({
   station: z.number(),
   offset: z.number(),
   distanceFromAlignment: z.number(),
   units: z.string(),
+  outOfRange: z.boolean().optional(),
+  equallyNearStations: z.array(z.number()).optional(),
+  warning: z.string().optional(),
 });
 
 const AlignmentReportStationSampleSchema = z.object({
@@ -112,6 +121,8 @@ const canonicalAlignmentInputShape = {
     "get_station_offset",
     "offset_create",
     "widen_transition",
+    "entities_get",
+    "replace_curve_with_lines",
   ]),
   name: z.string().optional(),
   station: z.number().optional(),
@@ -124,6 +135,8 @@ const canonicalAlignmentInputShape = {
   style: z.string().optional(),
   layer: z.string().optional(),
   labelSet: z.string().optional(),
+  bulges: z.array(z.number()).optional().describe("create: bulge per segment from point i to i+1 (tan(angle/4), negative = clockwise); spirals cannot be given this way."),
+  addCurvesBetweenTangents: z.boolean().optional().describe("create: let Civil 3D add curves between tangents (default true without bulges, false with bulges); false keeps the geometry exactly as given."),
   interval: z.number().positive().optional(),
   maximumSamples: z.number().int().positive().max(200).optional(),
   startX: z.number().optional(),
@@ -140,12 +153,16 @@ const canonicalAlignmentInputShape = {
   entityIndex: z.number().int().min(0).optional(),
   rawStation: z.number().optional(),
   nominalStation: z.number().optional(),
+  equationType: z.enum(["increasing", "decreasing"]).optional(),
+  stationMode: z.enum(["raw", "nominal"]).optional(),
   offsetName: z.string().optional(),
   side: z.enum(["left", "right"]).optional(),
   startStation: z.number().optional(),
   endStation: z.number().optional(),
   startOffset: z.number().optional(),
   endOffset: z.number().optional(),
+  strict: z.boolean().optional().describe("point_to_station: a point beyond the alignment's start or end is an error (default: the end station with outOfRange true)."),
+  maxOffset: z.number().optional().describe("point_to_station: refuse points farther than this from the alignment (model units, > 0)."),
 };
 
 const AlignmentListArgsSchema = z.object({
@@ -157,20 +174,30 @@ const AlignmentGetArgsSchema = z.object({
   name: z.string(),
 });
 
+// Civil 3D API stations are raw (no station equations). stationMode "nominal" converts a station as shown with
+// equations to the raw station first; one that occurs twice or not at all is refused.
 const AlignmentStationToPointArgsSchema = z.object({
   action: z.literal("station_to_point"),
   name: z.string(),
   station: z.number(),
   offset: z.number().optional(),
+  stationMode: z.enum(["raw", "nominal"]).optional(),
 });
 
+// C101: the nearest point on the alignment; strict makes a point beyond its start or end an error, maxOffset (model units)
+// rejects points farther from the alignment.
 const AlignmentPointToStationArgsSchema = z.object({
   action: z.literal("point_to_station"),
   name: z.string(),
   x: z.number(),
   y: z.number(),
+  strict: z.boolean().optional(),
+  maxOffset: z.number().positive().optional(),
 });
 
+// C96: bulges (one per segment, |bulge| < 1) make arcs (spirals cannot be given); addCurvesBetweenTangents false keeps the
+// geometry exactly as given (default true without bulges, false with them); startStation is the station at the first point.
+// Recreates an alignment from entities_get of another drawing.
 const AlignmentCreateArgsSchema = z.object({
   action: z.literal("create"),
   name: z.string(),
@@ -180,7 +207,10 @@ const AlignmentCreateArgsSchema = z.object({
   style: z.string().optional(),
   layer: z.string().optional(),
   labelSet: z.string().optional(),
-});
+  bulges: z.array(z.number().gt(-1).lt(1)).optional(),
+  addCurvesBetweenTangents: z.boolean().optional(),
+  startStation: z.number().optional(),
+}).refine((a) => a.bulges === undefined || a.bulges.length === a.points.length - 1, { message: "bulges must have one value per segment (points.length - 1)" });
 
 const AlignmentDeleteArgsSchema = z.object({
   action: z.literal("delete"),
@@ -229,12 +259,31 @@ const AlignmentDeleteEntityArgsSchema = z.object({
   entityIndex: z.number().int().min(0),
 });
 
+// At raw station rawStation the shown station becomes nominalStation (station ahead); equationType says whether
+// stations increase or decrease from there on (default increasing, also when nominalStation < rawStation).
 const AlignmentSetStationEquationArgsSchema = z.object({
   action: z.literal("set_station_equation"),
   name: z.string(),
   rawStation: z.number(),
   nominalStation: z.number(),
+  equationType: z.enum(["increasing", "decreasing"]).optional(),
 });
+
+const AlignmentEntitiesGetArgsSchema = z.object({
+  action: z.literal("entities_get"),
+  name: z.string(),
+});
+
+// Replaces a curve by straight lines meeting at corners: exact end of the entity before -> points -> exact start of
+// the entity after, linked through the entity chain; aborted (nothing changes) unless the alignment stays continuous
+// and its length is old - curve + new lines within 1 mm. The curve by entityIndex (as in get) or a raw station in it.
+const AlignmentReplaceCurveWithLinesArgsSchema = z.object({
+  action: z.literal("replace_curve_with_lines"),
+  name: z.string(),
+  entityIndex: z.number().int().min(0).optional(),
+  station: z.number().optional(),
+  points: z.array(Point2DSchema).max(50).optional(),
+}).refine((a) => (a.entityIndex !== undefined) !== (a.station !== undefined), { message: "Give either entityIndex or station of the curve." });
 
 const AlignmentGetStationOffsetArgsSchema = z.object({
   action: z.literal("get_station_offset"),
@@ -331,6 +380,7 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
           name: args.name,
           station: args.station,
           offset: args.offset ?? 0,
+          stationMode: args.stationMode ?? "raw",
         }),
       ),
     },
@@ -347,6 +397,8 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
           name: args.name,
           x: args.x,
           y: args.y,
+          strict: args.strict,
+          maxOffset: args.maxOffset,
         }),
       ),
     },
@@ -367,6 +419,9 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
           style: args.style,
           layer: args.layer,
           labelSet: args.labelSet,
+          bulges: args.bulges,
+          addCurvesBetweenTangents: args.addCurvesBetweenTangents,
+          startStation: args.startStation,
         }),
       ),
     },
@@ -526,6 +581,38 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
           alignmentName: args.name,
           rawStation: args.rawStation,
           nominalStation: args.nominalStation,
+          equationType: args.equationType ?? "increasing",
+        }),
+      ),
+    },
+    entities_get: {
+      action: "entities_get",
+      inputSchema: AlignmentEntitiesGetArgsSchema,
+      responseSchema: GenericAlignmentResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["alignmentEntitiesGet"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("alignmentEntitiesGet", {
+          name: args.name,
+        }),
+      ),
+    },
+    replace_curve_with_lines: {
+      action: "replace_curve_with_lines",
+      inputSchema: AlignmentReplaceCurveWithLinesArgsSchema,
+      responseSchema: GenericAlignmentResponseSchema,
+      capabilities: ["edit"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["alignmentReplaceCurveWithLines"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("alignmentReplaceCurveWithLines", {
+          alignmentName: args.name,
+          entityIndex: args.entityIndex,
+          station: args.station,
+          points: args.points ?? [],
         }),
       ),
     },
@@ -589,7 +676,7 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
     {
       toolName: "civil3d_alignment",
       displayName: "Civil 3D Alignment",
-      description: "Reads Civil 3D alignments, reports geometry, and manages editing actions through a single domain tool.",
+      description: "Reads Civil 3D alignments, reports geometry, and manages editing actions through a single domain tool. Stations are raw (without station equations); station_to_point takes stationMode nominal to convert. entities_get shows the entity chain; replace_curve_with_lines turns a curve into linked straight lines.",
       inputShape: canonicalAlignmentInputShape,
       supportedActions: [
         "list",
@@ -606,6 +693,8 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
         "get_station_offset",
         "offset_create",
         "widen_transition",
+        "entities_get",
+        "replace_curve_with_lines",
       ],
       resolveAction: (rawArgs) => ({
         action: String(rawArgs.action ?? ""),
@@ -712,6 +801,7 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
         alignmentName: z.string(),
         rawStation: z.number(),
         nominalStation: z.number(),
+        equationType: z.enum(["increasing", "decreasing"]).optional(),
       },
       supportedActions: ["set_station_equation"],
       resolveAction: (rawArgs) => ({
@@ -721,6 +811,7 @@ export const ALIGNMENT_DOMAIN_DEFINITION: DomainToolDefinition = {
           name: rawArgs.alignmentName,
           rawStation: rawArgs.rawStation,
           nominalStation: rawArgs.nominalStation,
+          equationType: rawArgs.equationType,
         },
       }),
     },

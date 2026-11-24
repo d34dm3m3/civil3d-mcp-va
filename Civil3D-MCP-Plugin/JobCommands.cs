@@ -11,6 +11,17 @@ public static class JobCommands
       ["publish_sheet_pdf"] = "publishSheetPdf",
       ["surface_dem_import"] = "createSurfaceFromDem",
       ["bulk_qc_report"] = "qcReportGenerate",
+      // C65 (2026-10-09): surface work that runs for minutes (0,5 M points: 6-7 min) outlived the 120 s client
+      // timeout and the answer was lost; as a job the call returns at once and civil3d_job status follows it
+      ["surface_add_points"] = "addSurfacePoints",
+      ["surface_add_breakline"] = "addSurfaceBreakline",
+      ["surface_add_boundary"] = "addSurfaceBoundary",
+      ["surface_paste"] = "pasteSurface",
+      ["surface_simplify"] = "simplifySurface",
+      ["surface_build_options"] = "setSurfaceBuildOptions",
+      ["surface_export_landxml"] = "exportLandXml",
+      // C94: a large base map may take longer than the client timeout to transform and write
+      ["drawing_transform"] = "drawingTransform",
     };
 
   public static Task<object?> StartJobAsync(JsonObject? parameters)

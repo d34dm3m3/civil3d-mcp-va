@@ -17,6 +17,7 @@ public static class DrawingCommands
     var doc = App.DocumentManager.MdiActiveDocument;
     var process = System.Diagnostics.Process.GetCurrentProcess();
     var jobs = JobRegistry.GetStats();
+    var documents = DocumentSnapshot.Current;
 
     object response = new Dictionary<string, object?>
     {
@@ -24,6 +25,10 @@ public static class DrawingCommands
       ["civil3dVersion"] = App.GetSystemVariable("ACADVER")?.ToString(),
       ["pluginVersion"] = typeof(PluginEntry).Assembly.GetName().Version?.ToString(),
       ["drawingLoaded"] = doc != null,
+      // C93c: which drawing the next call runs in (the active one), and how many are open; from the snapshot taken on
+      // the main thread (health answers on the TCP thread).
+      ["activeDocument"] = documents.ActiveDocument,
+      ["documentCount"] = documents.DocumentCount,
       ["operationInProgress"] = status.OperationInProgress,
       ["currentOperation"] = status.CurrentOperation,
       ["queueDepth"] = status.QueueDepth,
@@ -84,7 +89,7 @@ public static class DrawingCommands
         ["coordinateSystem"] = coords.code,
         ["coordinateZone"] = coords.zone,
         ["datum"] = coords.datum,
-        ["scaleFactor"] = Convert.ToDouble(App.GetSystemVariable("DIMSCALE") ?? 1d),
+        ["scaleFactor"] = database.Dimscale,               // C93c: this drawing, not the current document's system variable
         ["elevationReference"] = coords.verticalDatum,
         ["defaultLayer"] = currentLayer.Name,
         ["defaultStyles"] = new Dictionary<string, object?>
@@ -99,32 +104,133 @@ public static class DrawingCommands
     });
   }
 
+  /// <summary>
+  /// Saves the active drawing over its own file, or with saveAs to a new file in the export roots. C97 (2026-10-10):
+  /// through the document (COM AcadDocument.Save, as QSAVE, or AcadDocument.SaveAs) in the application context, so a
+  /// successful save leaves the document saved: Database.SaveAs wrote the file but left DBMOD set (documents_list showed
+  /// unsavedChanges true right after saving, the template since M24) and a new drawing unnamed. The answer reports
+  /// unsavedChanges after the save. Inside a batch (a document's command context) and when the document has no COM
+  /// object, Database.SaveAs as before, with a warning.
+  /// </summary>
   public static Task<object?> SaveDrawingAsync(JsonObject? parameters)
   {
     var overwrite = PluginRuntime.GetOptionalBool(parameters, "overwrite") ?? false;
-    return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+    var saveAs = PluginRuntime.GetOptionalString(parameters, "saveAs");
+    // Saving the active drawing over its own file is not an export: its file necessarily exists. Boundary, local disk
+    // and overwrite checks apply to Save As, before Civil 3D is asked.
+    var saveAsPath = string.IsNullOrWhiteSpace(saveAs) ? null : FileBoundary.ResolveLocalExportPath(saveAs, overwrite, ".dwg");
+
+    if (CivilExecution.InBatch)
     {
-      var saveAs = PluginRuntime.GetOptionalString(parameters, "saveAs");
-      var targetPath = string.IsNullOrWhiteSpace(saveAs) ? database.Filename : saveAs;
-      if (string.IsNullOrWhiteSpace(targetPath))
+      return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
       {
-        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "saveDrawing requires 'saveAs' when the drawing has not been saved yet.");
+        var target = Target(doc, saveAsPath);
+        SaveDatabase(database, target);
+        DocumentCommands.NoteSaved(doc, target);   // C93: the document keeps its name; its file is remembered
+        return Saved(doc, target, "Database.SaveAs (in a batch)",
+          ["Saved through the database inside a batch: Civil 3D still reports unsaved changes and a drawing saved for the first time keeps its name; save on its own for that."]);
+      });
+    }
+
+    var requestedDrawing = PluginRuntime.GetRequestedDrawing();
+    return CivilExecution.ExecuteInApplicationContextAsync<object?>(() =>
+    {
+      var doc = App.DocumentManager.MdiActiveDocument ?? throw new JsonRpcDispatchException("CIVIL3D.NO_DRAWING", "No active drawing is open in Civil 3D.");
+      PluginRuntime.CheckRequestedDrawing(doc, requestedDrawing);   // C150: never save another drawing than the caller named
+      var target = Target(doc, saveAsPath);
+      if (saveAsPath == null && doc.IsReadOnly)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"'{doc.Name}' is open read-only; give saveAs to save a copy. Nothing was saved.");
+      // Review: checked again right before writing (the request may have waited for an idle Civil 3D); COM SaveAs
+      // overwrites without asking.
+      if (saveAsPath != null && !overwrite && File.Exists(saveAsPath))
+        throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"Output file already exists: {saveAsPath}. Set overwrite=true to replace it explicitly.");
+      object? acadDocument = null;
+      try
+      {
+        acadDocument = doc.GetAcadDocument();
+      }
+      catch (System.Exception)
+      {
+        // no COM document; the database path below
       }
 
-      // Saving the active drawing is not an export conflict: its current file
-      // necessarily exists. Boundary/overwrite checks apply only to Save As.
-      targetPath = string.IsNullOrWhiteSpace(saveAs)
-        ? Path.GetFullPath(targetPath)
-        : FileBoundary.ResolveExportPath(targetPath, overwrite, ".dwg");
-      database.SaveAs(targetPath, true, DwgVersion.Current, database.SecurityParameters);
-
-      return new Dictionary<string, object?>
+      string method;
+      var warnings = new List<string>();
+      try
       {
-        ["saved"] = true,
-        ["filePath"] = targetPath,
-      };
-    });
+        if (acadDocument == null)
+        {
+          using (doc.LockDocument()) SaveDatabase(doc.Database, target);
+          method = "Database.SaveAs";
+          warnings.Add("The document has no COM object, so it was saved through the database: Civil 3D still reports unsaved changes.");
+        }
+        else if (saveAsPath == null && doc.IsNamedDrawing && SameFileName(doc.Name, target))
+        {
+          // QSAVE writes the document's own file in its own format (a template stays a template).
+          Civil3DCompatibility.InvokeComMethod(acadDocument, "Save");
+          method = "AcadDocument.Save";
+        }
+        else
+        {
+          // A new file, or a drawing whose database was saved elsewhere (batch, no COM) without the document following:
+          // SaveAs writes the target and gives the document its name. acNative (64): the current DWG format, as
+          // Database.SaveAs wrote, not the user's default save format.
+          Civil3DCompatibility.InvokeComMethod(acadDocument, "SaveAs", target, AcNative);
+          method = "AcadDocument.SaveAs";
+        }
+      }
+      catch (Exception ex) when (ex is not JsonRpcDispatchException)
+      {
+        throw new JsonRpcDispatchException("CIVIL3D.FILE_IO_ERROR",
+          $"Saving '{doc.Name}' to '{target}' failed: {ex.Message} (If this is the first save of a drawing made from the original company template, try again: C73.)");
+      }
+
+      DocumentCommands.NoteSaved(doc, target);
+      PluginLog.Info("Documents", $"saveDrawing: '{doc.Name}' saved to {target} ({method}).");
+      return Saved(doc, target, method, warnings);
+    }, "saveDrawing", TimeSpan.FromSeconds(100));
   }
+
+  // AcSaveAsType.acNative: the current DWG format.
+  private const int AcNative = 64;
+
+  /// <summary>Whether a document name (the full path of a saved drawing) is the target file.</summary>
+  private static bool SameFileName(string documentName, string target)
+  {
+    try
+    {
+      return Path.IsPathFullyQualified(documentName) && string.Equals(Path.GetFullPath(documentName), target, StringComparison.OrdinalIgnoreCase);
+    }
+    catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+    {
+      return false;
+    }
+  }
+
+  /// <summary>The file to save to: saveAs, or the drawing's own file. C93 review: a drawing never saved has no file of
+  /// its own; its Database.Filename names the template it was made from, which a save without saveAs would overwrite.</summary>
+  private static string Target(Document doc, string? saveAsPath) =>
+    saveAsPath ?? DocumentCommands.PathOf(doc)
+      ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"saveDrawing requires 'saveAs': '{doc.Name}' has not been saved yet. Nothing was saved.");
+
+  private static void SaveDatabase(Database database, string target)
+  {
+    // C71 (live 2026-10-09): AutoCAD reads drawings lazily and keeps the source file open; read everything in and
+    // release the source file first when saving over it, as QSAVE does.
+    if (string.Equals(Path.GetFullPath(database.Filename ?? ""), target, StringComparison.OrdinalIgnoreCase))
+      database.CloseInput(true);
+    database.SaveAs(target, true, DwgVersion.Current, database.SecurityParameters);
+  }
+
+  private static Dictionary<string, object?> Saved(Document doc, string target, string method, List<string> warnings) => new()
+  {
+    ["saved"] = true,
+    ["filePath"] = DocumentCommands.PathOf(doc) ?? target,
+    ["drawingName"] = doc.Name,
+    ["unsavedChanges"] = DocumentCommands.HasUnsavedChanges(doc),
+    ["method"] = method,
+    ["warnings"] = warnings,
+  };
 
   public static async Task<object?> NewDrawingAsync(JsonObject? parameters)
   {
@@ -132,22 +238,32 @@ public static class DrawingCommands
     if (!string.IsNullOrWhiteSpace(templatePath))
     {
       templatePath = FileBoundary.ResolveImportPath(templatePath, ".dwt", ".dwg");
+      FileBoundary.RequireLocalDisk(templatePath);   // C93: local disks only
     }
 
-    return await CivilExecution.ExecuteInCommandContextAsync<object?>(() =>
+    // C93: created and activated in the application context (it ran in a document's command context, where AutoCAD
+    // defers a document switch until the command ends), so the next request already runs in the new drawing.
+    return await CivilExecution.ExecuteInApplicationContextAsync<object?>(() =>
     {
+      var previous = App.DocumentManager.MdiActiveDocument;
       var createdDocument = string.IsNullOrWhiteSpace(templatePath)
         ? App.DocumentManager.Add(string.Empty)
         : App.DocumentManager.Add(templatePath);
 
-      App.DocumentManager.MdiActiveDocument = createdDocument;
-      return Task.FromResult<object?>(new Dictionary<string, object?>
+      var active = DocumentCommands.Activate(createdDocument);
+      PluginLog.Info("Documents", $"newDrawing: '{createdDocument.Name}' created{(string.IsNullOrWhiteSpace(templatePath) ? "" : $" from {templatePath}")}, active {active}.");
+      return new Dictionary<string, object?>
       {
         ["drawingName"] = createdDocument.Name,
-        ["filePath"] = createdDocument.Database.Filename,
+        // C93: null until the drawing is saved (Database.Filename of a new drawing may name its template instead).
+        ["filePath"] = DocumentCommands.PathOf(createdDocument),
         ["templatePath"] = templatePath,
-      });
-    });
+        ["active"] = active,
+        ["activeDocument"] = App.DocumentManager.MdiActiveDocument?.Name,
+        ["previousDocument"] = previous?.Name,
+        ["note"] = "Not saved yet: give it a file with civil3d_drawing save (saveAs) before closing it with save: true.",
+      };
+    }, "newDrawing", TimeSpan.FromSeconds(100));
   }
 
   public static Task<object?> UndoDrawingAsync(JsonObject? parameters)
@@ -197,14 +313,21 @@ public static class DrawingCommands
     Database database,
     Transaction transaction)
   {
-    var unsavedChanges = Convert.ToInt32(App.GetSystemVariable("DBMOD") ?? 0) != 0;
-    var angularUnits = CivilObjectUtils.AngularUnits(Convert.ToInt16(App.GetSystemVariable("AUNITS") ?? 0));
+    // C93c (live 2026-10-10): read from this drawing, not through system variables of whichever document AutoCAD
+    // treats as current, and a drawing never saved has no file: its Database.Filename is the template it was made
+    // from (Drawing2.dwg reported the company template as fileName), so fileName is the document name and filePath null.
+    var unsavedChanges = DocumentCommands.HasUnsavedChanges(doc) ?? Convert.ToInt32(App.GetSystemVariable("DBMOD") ?? 0) != 0;
+    var angularUnits = CivilObjectUtils.AngularUnits((short)database.Aunits);
     var coordinateSystemCode = ReadCoordinateSystemCode(civilDoc);
+    var filePath = DocumentCommands.PathOf(doc);
 
     return new Dictionary<string, object?>
     {
-      ["fileName"] = Path.GetFileName(database.Filename),
-      ["filePath"] = database.Filename,
+      ["fileName"] = filePath != null ? Path.GetFileName(filePath) : Path.GetFileName(doc.Name),
+      ["filePath"] = filePath,
+      ["templatePath"] = filePath == null && !string.IsNullOrWhiteSpace(database.Filename) ? database.Filename : null,
+      ["activeDocument"] = App.DocumentManager.MdiActiveDocument?.Name,
+      ["contextDocument"] = App.DocumentManager.CurrentDocument?.Name,
       ["coordinateSystem"] = coordinateSystemCode,
       ["linearUnits"] = CivilObjectUtils.LinearUnits(database),
       ["angularUnits"] = angularUnits,
@@ -244,13 +367,16 @@ public static class DrawingCommands
     int limit)
   {
     var result = new List<Dictionary<string, object?>>();
-    var selection = doc.Editor.SelectImplied();
-    if (selection.Status != PromptStatus.OK || selection.Value == null)
+    // The pick-first set is gone by the time the plugin's command runs; use the selection the tracker
+    // captured when the user made it, and the live one only if the tracker has nothing.
+    var ids = SelectionTracker.For(doc);
+    if (ids.Length == 0)
     {
-      return result;
+      var selection = doc.Editor.SelectImplied();
+      if (selection.Status == PromptStatus.OK && selection.Value != null) ids = selection.Value.GetObjectIds();
     }
 
-    foreach (var objectId in selection.Value.GetObjectIds().Take(limit))
+    foreach (var objectId in ids.Take(limit))
     {
       var dbObject = transaction.GetObject(objectId, OpenMode.ForRead);
       if (dbObject == null)
@@ -263,6 +389,7 @@ public static class DrawingCommands
         ["handle"] = dbObject.Handle.ToString(),
         ["objectType"] = dbObject.GetType().Name,
         ["name"] = CivilObjectUtils.GetName(dbObject),
+        ["layer"] = (dbObject as Autodesk.AutoCAD.DatabaseServices.Entity)?.Layer,
         ["description"] = CivilObjectUtils.GetStringProperty(dbObject, "Description"),
       });
     }

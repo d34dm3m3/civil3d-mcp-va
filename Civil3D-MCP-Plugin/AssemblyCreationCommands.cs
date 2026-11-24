@@ -3,6 +3,7 @@ using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Civil.ApplicationServices;
 using Autodesk.Civil.DatabaseServices;
+using Autodesk.Civil.Runtime;
 using AcDbObject = Autodesk.AutoCAD.DatabaseServices.DBObject;
 
 namespace Civil3DMcpPlugin;
@@ -17,12 +18,15 @@ public static class AssemblyCreationCommands
   {
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
+      var usage = GetCorridorUsage(civilDoc, transaction);
       var assemblies = civilDoc.AssemblyCollection
         .Select(id => CivilObjectUtils.GetRequiredObject<Assembly>(transaction, id, OpenMode.ForRead))
         .Select(assembly =>
         {
           var summary = ToAssemblySummary(assembly);
-          summary["usedByCorridors"] = new List<string>();
+          summary["usedByCorridors"] = usage.TryGetValue(assembly.ObjectId, out var corridors)
+            ? corridors
+            : new List<string>();
           return summary;
         })
         .ToList();
@@ -34,23 +38,13 @@ public static class AssemblyCreationCommands
   public static Task<object?> GetAssemblyAsync(JsonObject? parameters)
   {
     var name = PluginRuntime.GetRequiredString(parameters, "name");
+    var verbose = PluginRuntime.GetOptionalBool(parameters, "verbose") ?? false;
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var assembly = FindAssemblyByName(civilDoc, transaction, name, OpenMode.ForRead);
-      var usedByCorridors = new List<string>();
-
-      foreach (ObjectId corridorId in civilDoc.CorridorCollection)
-      {
-        var corridor = CivilObjectUtils.GetRequiredObject<Corridor>(transaction, corridorId, OpenMode.ForRead);
-        foreach (Baseline baseline in corridor.Baselines)
-        {
-          foreach (BaselineRegion region in baseline.BaselineRegions)
-          {
-            if (region.AssemblyId == assembly.ObjectId && !usedByCorridors.Contains(corridor.Name))
-              usedByCorridors.Add(corridor.Name);
-          }
-        }
-      }
+      var usedByCorridors = GetCorridorUsage(civilDoc, transaction).TryGetValue(assembly.ObjectId, out var corridors)
+        ? corridors
+        : new List<string>();
 
       return new Dictionary<string, object?>
       {
@@ -59,7 +53,7 @@ public static class AssemblyCreationCommands
         ["subassemblyCount"] = GetSubassemblyIds(assembly).Count,
         ["style"] = GetStyleName(assembly, transaction),
         ["type"] = assembly.Type.ToString(),
-        ["subassemblies"] = GetSubassemblies(assembly, transaction),
+        ["subassemblies"] = GetSubassemblies(assembly, transaction, verbose),
         ["usedByCorridors"] = usedByCorridors,
       };
     });
@@ -102,41 +96,67 @@ public static class AssemblyCreationCommands
     var assemblyName = PluginRuntime.GetRequiredString(parameters, "assemblyName");
     var subassemblyType = PluginRuntime.GetRequiredString(parameters, "subassemblyType");
     var side = PluginRuntime.GetRequiredString(parameters, "side");
-    if (!new[] { "Left", "Right", "Both" }.Contains(side, StringComparer.OrdinalIgnoreCase))
-      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "side must be Left, Right, or Both.");
+    if (!new[] { "Left", "Right", "Both", "None" }.Contains(side, StringComparer.OrdinalIgnoreCase))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "side must be Left, Right, Both, or None.");
 
     var subParams = ReadParameters(parameters?["parameters"] as JsonObject);
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var assembly = FindAssemblyByName(civilDoc, transaction, assemblyName, OpenMode.ForWrite);
-      var requestedSides = side.Equals("Both", StringComparison.OrdinalIgnoreCase)
-        ? new[] { "Left", "Right" }
-        : new[] { side };
+      // "None" = symmetric subassembly without a Side parameter (e.g. TrenchPipe1).
+      string?[] requestedSides = side.ToLowerInvariant() switch
+      {
+        "both" => new string?[] { "Left", "Right" },
+        "none" => new string?[] { null },
+        _ => new string?[] { side },
+      };
       var created = new List<Dictionary<string, object?>>();
 
       foreach (var requestedSide in requestedSides)
       {
-        var subassemblyName = $"{subassemblyType}-{requestedSide}-{Guid.NewGuid():N}";
+        var subassemblyName = $"{subassemblyType}-{requestedSide ?? "None"}-{Guid.NewGuid():N}";
         var subassemblyId = civilDoc.SubassemblyCollection.ImportStockSubassembly(
           subassemblyName,
           subassemblyType,
           assembly.Location);
         assembly.AddSubassembly(subassemblyId);
 
-        var subassembly = CivilObjectUtils.GetRequiredObject<AcDbObject>(transaction, subassemblyId, OpenMode.ForWrite);
-        if (!Civil3DCompatibility.TrySetProperty(subassembly, "Side", requestedSide))
+        var subassembly = CivilObjectUtils.GetRequiredObject<Subassembly>(transaction, subassemblyId, OpenMode.ForWrite);
+        if (requestedSide == null)
         {
-          throw new JsonRpcDispatchException(
-            "CIVIL3D.API_ERROR",
-            $"Stock subassembly '{subassemblyType}' does not expose a writable Side parameter. No implicit side was assumed.");
+          if (subassembly.HasSide)
+          {
+            throw new JsonRpcDispatchException(
+              "CIVIL3D.INVALID_INPUT",
+              $"Stock subassembly '{subassemblyType}' has a Side parameter; use side Left, Right, or Both. The transaction was not committed.");
+          }
         }
-        ApplySubassemblyParameters(subassembly, subParams);
+        else
+        {
+          if (!subassembly.HasSide)
+          {
+            throw new JsonRpcDispatchException(
+              "CIVIL3D.INVALID_INPUT",
+              $"Stock subassembly '{subassemblyType}' is symmetric and has no Side parameter; use side None. The transaction was not committed.");
+          }
+          subassembly.Side = Enum.Parse<SubassemblySideType>(requestedSide, ignoreCase: true);
+        }
+
+        var updated = ApplySubassemblyParameters(subassembly, subParams);
+        if (updated.Count != subParams.Count)
+        {
+          var missing = subParams.Keys.Except(updated, StringComparer.OrdinalIgnoreCase);
+          throw new JsonRpcDispatchException(
+            "CIVIL3D.INVALID_INPUT",
+            $"Subassembly parameters were not writable on '{subassemblyType}': {string.Join(", ", missing)}. The transaction was not committed.");
+        }
 
         created.Add(new Dictionary<string, object?>
         {
           ["name"] = CivilObjectUtils.GetName(subassembly) ?? subassemblyName,
           ["handle"] = CivilObjectUtils.GetHandle(subassembly),
-          ["side"] = requestedSide,
+          ["side"] = requestedSide ?? "None",
+          ["stockParameters"] = ReadStockParameters(subassembly),
         });
       }
 
@@ -221,11 +241,21 @@ public static class AssemblyCreationCommands
     var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
     if (values == null) return result;
     foreach (var pair in values)
-      result[pair.Key] = pair.Value?.GetValue<object>();
+      result[pair.Key] = ToPrimitive(pair.Value);
     return result;
   }
 
-  private static Assembly FindAssemblyByName(
+  // JsonValue.GetValue<object>() yields a JsonElement, which IConvertible-based setters reject.
+  private static object? ToPrimitive(JsonNode? node)
+  {
+    if (node is not JsonValue value) return node?.ToJsonString();
+    if (value.TryGetValue<bool>(out var b)) return b;
+    if (value.TryGetValue<double>(out var d)) return d;
+    if (value.TryGetValue<string>(out var s)) return s;
+    return value.ToJsonString();
+  }
+
+  internal static Assembly FindAssemblyByName(
     CivilDocument civilDocument,
     Transaction transaction,
     string name,
@@ -254,10 +284,53 @@ public static class AssemblyCreationCommands
     var updated = new List<string>();
     foreach (var pair in parameters)
     {
-      if (Civil3DCompatibility.TrySetProperty(subassembly, pair.Key, pair.Value))
+      // Stock subassembly inputs (Width, Slope, ...) live in the Params* collections,
+      // not as CLR properties; try those first, then fall back to object properties.
+      if (subassembly is Subassembly sa && TrySetStockParameter(sa, pair.Key, pair.Value))
+        updated.Add(pair.Key);
+      else if (Civil3DCompatibility.TrySetProperty(subassembly, pair.Key, pair.Value))
         updated.Add(pair.Key);
     }
     return updated;
+  }
+
+  private static bool TrySetStockParameter(Subassembly sa, string key, object? value)
+  {
+    foreach (ParamDouble p in sa.ParamsDouble)
+    {
+      if (!string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase)) continue;
+      p.Value = Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+      return true;
+    }
+    foreach (ParamLong p in sa.ParamsLong)
+    {
+      if (!string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase)) continue;
+      p.Value = Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture);
+      return true;
+    }
+    foreach (ParamBool p in sa.ParamsBool)
+    {
+      if (!string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase)) continue;
+      p.Value = Convert.ToBoolean(value, System.Globalization.CultureInfo.InvariantCulture);
+      return true;
+    }
+    foreach (ParamString p in sa.ParamsString)
+    {
+      if (!string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase)) continue;
+      p.Value = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+      return true;
+    }
+    return false;
+  }
+
+  private static Dictionary<string, object?> ReadStockParameters(Subassembly sa)
+  {
+    var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+    foreach (ParamDouble p in sa.ParamsDouble) values[p.Key] = p.Value;
+    foreach (ParamLong p in sa.ParamsLong) values[p.Key] = p.Value;
+    foreach (ParamBool p in sa.ParamsBool) values[p.Key] = p.Value;
+    foreach (ParamString p in sa.ParamsString) values[p.Key] = p.Value;
+    return values;
   }
 
   private static string? GetStyleName(Assembly assembly, Transaction transaction)
@@ -266,25 +339,54 @@ public static class AssemblyCreationCommands
     return CivilObjectUtils.GetName(transaction.GetObject(assembly.StyleId, OpenMode.ForRead));
   }
 
-  private static List<Dictionary<string, object?>> GetSubassemblies(Assembly assembly, Transaction transaction)
+  private static List<Dictionary<string, object?>> GetSubassemblies(Assembly assembly, Transaction transaction, bool verbose)
   {
     return GetSubassemblyIds(assembly)
       .Select(id => CivilObjectUtils.GetRequiredObject<AcDbObject>(transaction, id, OpenMode.ForRead))
-      .Select(ToSubassemblySummary)
+      .Select(subassembly => ToSubassemblySummary(subassembly, verbose))
       .ToList();
   }
 
-  private static Dictionary<string, object?> ToSubassemblySummary(AcDbObject subassembly)
+  private static Dictionary<string, object?> ToSubassemblySummary(AcDbObject subassembly) =>
+    ToSubassemblySummary(subassembly, verbose: false);
+
+  private static Dictionary<string, object?> ToSubassemblySummary(AcDbObject subassembly, bool verbose)
   {
-    return new Dictionary<string, object?>
+    var summary = new Dictionary<string, object?>
     {
       ["name"] = CivilObjectUtils.GetName(subassembly) ?? subassembly.Handle.ToString(),
       ["handle"] = CivilObjectUtils.GetHandle(subassembly),
       ["type"] = subassembly.GetType().Name,
       ["className"] = subassembly.GetType().Name,
-      ["side"] = Civil3DCompatibility.GetPropertyValue(subassembly, "Side")?.ToString()?.ToLowerInvariant() ?? "none",
-      ["parameters"] = Civil3DCompatibility.GetReadableScalarProperties(subassembly),
+      ["side"] = subassembly is Subassembly typed
+        ? (typed.HasSide ? typed.Side.ToString().ToLowerInvariant() : "none")
+        : "none",
+      ["stockParameters"] = subassembly is Subassembly sa ? ReadStockParameters(sa) : null,
     };
+    // The reflected .NET property dump (~80 entries) is opt-in.
+    if (verbose)
+      summary["parameters"] = Civil3DCompatibility.GetReadableScalarProperties(subassembly);
+    return summary;
+  }
+
+  private static Dictionary<ObjectId, List<string>> GetCorridorUsage(CivilDocument civilDoc, Transaction transaction)
+  {
+    var usage = new Dictionary<ObjectId, List<string>>();
+    foreach (ObjectId corridorId in civilDoc.CorridorCollection)
+    {
+      var corridor = CivilObjectUtils.GetRequiredObject<Corridor>(transaction, corridorId, OpenMode.ForRead);
+      foreach (Baseline baseline in corridor.Baselines)
+      {
+        foreach (BaselineRegion region in baseline.BaselineRegions)
+        {
+          if (!usage.TryGetValue(region.AssemblyId, out var names))
+            usage[region.AssemblyId] = names = new List<string>();
+          if (!names.Contains(corridor.Name))
+            names.Add(corridor.Name);
+        }
+      }
+    }
+    return usage;
   }
 
   private static Dictionary<string, object?> ToAssemblySummary(Assembly assembly)

@@ -7,6 +7,31 @@ namespace Civil3DMcpPlugin;
 
 public static class LookupUtils
 {
+  /// <summary>
+  /// Strict layer lookup: returns the named layer, creates it when allowed,
+  /// otherwise throws. Unlike GetLayerId it never falls back to CLAYER.
+  /// </summary>
+  public static ObjectId GetOrCreateLayerId(Database database, Transaction transaction, string layerName, bool createIfMissing)
+  {
+    var layerTable = CivilObjectUtils.GetRequiredObject<LayerTable>(transaction, database.LayerTableId, OpenMode.ForRead);
+    if (layerTable.Has(layerName))
+      return layerTable[layerName];
+
+    if (!createIfMissing)
+    {
+      throw new JsonRpcDispatchException(
+        "CIVIL3D.OBJECT_NOT_FOUND",
+        $"Layer '{layerName}' does not exist. Pass createLayer=true to create it. No entity was created.");
+    }
+
+    SymbolUtilityServices.ValidateSymbolName(layerName, false);
+    layerTable.UpgradeOpen();
+    using var record = new LayerTableRecord { Name = layerName };
+    var layerId = layerTable.Add(record);
+    transaction.AddNewlyCreatedDBObject(record, true);
+    return layerId;
+  }
+
   public static ObjectId GetLayerId(Database database, Transaction transaction, string? layerName)
   {
     if (string.IsNullOrWhiteSpace(layerName))
@@ -69,24 +94,13 @@ public static class LookupUtils
 
   public static ObjectId GetProfileViewStyleId(CivilDocument civilDoc, Transaction transaction, string? styleName)
   {
-    var styles = CivilObjectUtils.GetPropertyValue<object>(civilDoc.Styles, "ProfileViewStyles");
-    return styles != null
-      ? GetStyleId(styles, transaction, styleName)
-      : ObjectId.Null;
+    return GetStyleIdStrict(civilDoc.Styles.ProfileViewStyles, transaction, styleName, "Profile view style");
   }
 
+  // Band set styles live on StylesRoot, not on LabelSetStylesRoot (the old lookup always returned Null).
   public static ObjectId GetProfileViewBandSetId(CivilDocument civilDoc, Transaction transaction, string? bandSetName)
   {
-    if (string.IsNullOrWhiteSpace(bandSetName))
-    {
-      return ObjectId.Null;
-    }
-
-    var labelSetStyles = civilDoc.Styles.LabelSetStyles;
-    var bandSetStyles = CivilObjectUtils.GetPropertyValue<object>(labelSetStyles, "ProfileViewBandSetStyles");
-    return bandSetStyles != null
-      ? GetStyleId(bandSetStyles, transaction, bandSetName)
-      : ObjectId.Null;
+    return GetStyleIdStrict(civilDoc.Styles.ProfileViewBandSetStyles, transaction, bandSetName, "Profile view band set");
   }
 
   public static ObjectId GetParcelStyleId(CivilDocument civilDoc, Transaction transaction, string? styleName)
@@ -163,6 +177,51 @@ public static class LookupUtils
     }
 
     return fallback;
+  }
+
+  /// <summary>
+  /// Named style, or the first style when no name is given. Unlike GetStyleId an unknown
+  /// name throws (listing the available names) instead of silently using the first style.
+  /// </summary>
+  internal static ObjectId GetStyleIdStrict(object collection, Transaction transaction, string? styleName, string kind)
+  {
+    var names = new List<string>();
+    var first = ObjectId.Null;
+
+    foreach (var objectId in EnumerateObjectIds(collection))
+    {
+      if (objectId == ObjectId.Null)
+      {
+        continue;
+      }
+
+      if (string.IsNullOrWhiteSpace(styleName))
+      {
+        return objectId;
+      }
+
+      if (first == ObjectId.Null)
+      {
+        first = objectId;
+      }
+
+      var name = CivilObjectUtils.GetName(transaction.GetObject(objectId, OpenMode.ForRead)) ?? string.Empty;
+      if (string.Equals(name, styleName, StringComparison.OrdinalIgnoreCase))
+      {
+        return objectId;
+      }
+
+      names.Add(name);
+    }
+
+    if (first == ObjectId.Null)
+    {
+      throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"The drawing has no {kind.ToLowerInvariant()}s.");
+    }
+
+    throw new JsonRpcDispatchException(
+      "CIVIL3D.INVALID_INPUT",
+      $"{kind} '{styleName}' was not found. Available: {string.Join(", ", names)}.");
   }
 
   private static IEnumerable<ObjectId> EnumerateObjectIds(object? collection)

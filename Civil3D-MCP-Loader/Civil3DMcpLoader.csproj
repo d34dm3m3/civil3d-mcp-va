@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- C65 (2026-10-09): loader for the Civil 3D MCP plugin. Autoloaded instead of Civil3DMcpPlugin.dll; loads a
+       shadow copy of the plugin so the real DLL in bin/Release is never locked.
+       Deploy: copy Civil3DMcpLoader.dll next to Civil3DMcpPlugin.dll (the trusted folder). -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Civil3DReferencesPath Condition="'$(Civil3DReferencesPath)' == ''">..\C_References</Civil3DReferencesPath>
+  </PropertyGroup>
+  <Import Project="..\Civil3D-MCP-Plugin\GeneratedVersion.props" />
+
+  <ItemGroup>
+    <Reference Include="accoremgd">
+      <HintPath>$(Civil3DReferencesPath)\accoremgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Acdbmgd">
+      <HintPath>$(Civil3DReferencesPath)\AcDbMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Acmgd">
+      <HintPath>$(Civil3DReferencesPath)\acmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

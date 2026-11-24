@@ -33,7 +33,8 @@ export type ToolDomain =
   | "help"
   | "catchment"
   | "stm"
-  | "plugin";
+  | "plugin"
+  | "invoke";
 
 export type ToolCapability =
   | "query"

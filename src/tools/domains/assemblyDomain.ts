@@ -21,13 +21,14 @@ const SubassemblySchema = z.object({
   name: z.string(),
   side: z.enum(["left", "right", "none"]),
   className: z.string(),
-  parameters: z.record(AssemblyParameterValueSchema),
+  parameters: z.record(AssemblyParameterValueSchema).optional(),
+  stockParameters: z.record(AssemblyParameterValueSchema).nullable().optional(),
 });
 
 const AssemblyDetailResponseSchema = z.object({
   name: z.string(),
   handle: z.string(),
-  style: z.string(),
+  style: z.string().nullable(),
   subassemblies: z.array(SubassemblySchema),
   usedByCorridors: z.array(z.string()),
 });
@@ -43,10 +44,11 @@ const canonicalAssemblyInputShape = {
   assemblyType: z.enum(["UndividedCrownedRoad", "UndividedPlanarRoad", "DividedCrownedRoad", "DividedPlanarRoad", "Other", "Railway"]).optional(),
   assemblyName: z.string().optional(),
   subassemblyType: z.string().optional(),
-  side: z.enum(["Left", "Right", "Both"]).optional(),
+  side: z.enum(["Left", "Right", "Both", "None"]).optional(),
   parameters: z.record(AssemblyParameterValueSchema).optional(),
   subassemblyName: z.string().optional(),
   delete: z.boolean().optional(),
+  verbose: z.boolean().optional(),
 };
 
 const AssemblyListArgsSchema = z.object({
@@ -56,6 +58,7 @@ const AssemblyListArgsSchema = z.object({
 const AssemblyGetArgsSchema = z.object({
   action: z.literal("get"),
   name: z.string(),
+  verbose: z.boolean().optional(),
 });
 
 const AssemblyCreateArgsSchema = z.object({
@@ -73,7 +76,7 @@ const AssemblyCreateSubassemblyArgsSchema = z.object({
   action: z.literal("create_subassembly"),
   assemblyName: z.string(),
   subassemblyType: z.string(),
-  side: z.enum(["Left", "Right", "Both"]),
+  side: z.enum(["Left", "Right", "Both", "None"]),
   parameters: z.record(AssemblyParameterValueSchema).optional(),
 });
 
@@ -111,6 +114,7 @@ export const ASSEMBLY_DOMAIN_DEFINITION: DomainToolDefinition = {
       execute: async (args) => await withApplicationConnection(
         async (appClient) => await appClient.sendCommand("getAssembly", {
           name: args.name,
+          verbose: args.verbose ?? false,
         }),
       ),
     },
@@ -212,7 +216,7 @@ export const ASSEMBLY_DOMAIN_DEFINITION: DomainToolDefinition = {
       inputShape: {
         assemblyName: z.string(),
         subassemblyType: z.string(),
-        side: z.enum(["Left", "Right", "Both"]),
+        side: z.enum(["Left", "Right", "Both", "None"]),
         parameters: z.record(AssemblyParameterValueSchema).optional(),
       },
       supportedActions: ["create_subassembly"],

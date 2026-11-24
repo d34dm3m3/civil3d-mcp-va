@@ -83,18 +83,29 @@ public sealed class RpcTcpServer
           requestCancellation,
           disconnectMonitorCancellation.Token);
 
-        var response = await _handler(request, requestCancellation.Token);
-        disconnectMonitorCancellation.Cancel();
-        var clientDisconnected = await disconnectMonitor;
-        if (clientDisconnected)
+        // C93: work registered by the request to run once the client has the answer (document_close).
+        var answer = AnswerScope.Begin();
+        var answerWritten = false;
+        try
         {
-          PluginLog.Debug("RpcTcpServer", "Skipped response write because the client disconnected.");
-          return;
-        }
+          var response = await _handler(request, requestCancellation.Token);
+          disconnectMonitorCancellation.Cancel();
+          var clientDisconnected = await disconnectMonitor;
+          if (clientDisconnected)
+          {
+            PluginLog.Debug("RpcTcpServer", "Skipped response write because the client disconnected.");
+            return;
+          }
 
-        var responseBytes = Encoding.UTF8.GetBytes(response);
-        await stream.WriteAsync(responseBytes, cancellationToken);
-        await stream.FlushAsync(cancellationToken);
+          var responseBytes = Encoding.UTF8.GetBytes(response);
+          await stream.WriteAsync(responseBytes, cancellationToken);
+          await stream.FlushAsync(cancellationToken);
+          answerWritten = true;
+        }
+        finally
+        {
+          answer.Complete(answerWritten);
+        }
       }
     }
     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -204,5 +215,85 @@ public sealed class RpcTcpServer
     }
 
     return false;
+  }
+}
+
+/// <summary>
+/// C93 (2026-10-10): one per request. A request may register one step that has to wait until the client has the
+/// answer: document_close closes the drawing only after the answer has been written (requested: never
+/// close before the answer has been sent). The server completes the scope in a finally, with whether a result (not an error) was written; the step
+/// is told so and skips its work otherwise. Should the server never complete it, the step is completed as not written
+/// after a minute, so whatever it holds (the host gate) is never kept for good.
+/// </summary>
+internal sealed class AnswerScope
+{
+  private static readonly AsyncLocal<AnswerScope?> CurrentScope = new();
+  private static readonly TimeSpan CompletionDeadline = TimeSpan.FromSeconds(60);
+
+  private readonly object _sync = new();
+  private Action<bool>? _afterAnswer;
+  private bool _completed;
+  private bool _result;
+
+  /// <summary>The scope of the request running on this async flow, null outside a TCP request (a test).</summary>
+  internal static AnswerScope? Current => CurrentScope.Value;
+
+  /// <summary>False once the answer has been handled (a job started by the request still carries the scope).</summary>
+  internal bool IsOpen
+  {
+    get
+    {
+      lock (_sync) return !_completed;
+    }
+  }
+
+  internal static AnswerScope Begin()
+  {
+    var scope = new AnswerScope();
+    CurrentScope.Value = scope;
+    return scope;
+  }
+
+  /// <summary>Marks the answer as a result; an error answer never runs the step.</summary>
+  internal void MarkResult()
+  {
+    lock (_sync) _result = true;
+  }
+
+  /// <summary>Registers the step (one per request); false when one is registered already or the answer is done.</summary>
+  internal bool TryRegister(Action<bool> afterAnswer)
+  {
+    lock (_sync)
+    {
+      if (_afterAnswer != null || _completed) return false;
+      _afterAnswer = afterAnswer;
+    }
+
+    _ = Task.Delay(CompletionDeadline).ContinueWith(_ => Complete(false), TaskScheduler.Default);
+    return true;
+  }
+
+  internal void Complete(bool answerWritten)
+  {
+    Action<bool>? afterAnswer;
+    bool written;
+    lock (_sync)
+    {
+      if (_completed) return;
+      _completed = true;
+      afterAnswer = _afterAnswer;
+      _afterAnswer = null;
+      written = answerWritten && _result;
+    }
+
+    if (afterAnswer == null) return;
+    try
+    {
+      afterAnswer(written);
+    }
+    catch (Exception ex)
+    {
+      PluginLog.Error("RpcTcpServer", "The step after the answer failed to start.", ex);
+    }
   }
 }

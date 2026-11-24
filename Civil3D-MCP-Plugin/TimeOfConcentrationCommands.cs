@@ -66,7 +66,7 @@ public static class TimeOfConcentrationCommands
         {
           ["name"] = "tr55_sheet",
           ["displayName"] = "TR-55 Sheet Flow",
-          ["description"] = "Tt = 0.007 * (nL)^0.8 / (P2^0.5 * S^0.4). For overland sheet flow ≤ 300 ft.",
+          ["description"] = "Tt = 0.007 * (nL)^0.8 / (P2^0.5 * S^0.4). For overland sheet flow <= 300 ft.",
           ["requiredParameters"] = new List<string> { "manningsN", "flowLength_ft", "rainfall2yr24hr_in", "slope_ftPerFt" },
         },
         new()

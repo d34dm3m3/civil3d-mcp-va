@@ -9,6 +9,16 @@ namespace Civil3DMcpPlugin;
 
 public static class CivilObjectUtils
 {
+  /// <summary>C155 (2026-10-21): an AutoCAD handle from its hexadecimal text; anything else is invalid input (was a
+  /// FormatException from Convert.ToInt64 in seven commands, reported as an internal error).</summary>
+  public static Handle ParseHandle(string? text)
+  {
+    var h = text?.Trim() ?? "";
+    if (h.Length == 0 || h.Length > 16 || !h.All(Uri.IsHexDigit))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"'{text}' is not a handle (1-16 hexadecimal digits).");
+    return new Handle(Convert.ToInt64(h, 16));
+  }
+
   public static string GetHandle(AcDbObject dbObject)
   {
     return dbObject.Handle.ToString();

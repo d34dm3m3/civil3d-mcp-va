@@ -457,8 +457,12 @@ public static class QcCommands
 
           if (minCover.HasValue)
           {
-            var coverDepth = GetAnyDouble(pipe, "CoverDepth", "MinimumCover", "CoverMin") ?? 0;
-            if (coverDepth < minCover.Value)
+            // C196: least cover over the crown along the pipe against its reference surface (CoverDepth does not exist in
+            // AeccDbMgd 2026 and MinimumCover is a limit, so the old check always read 0)
+            double coverDepth = double.NaN;
+            if (pipe is Pipe pp && !pp.RefSurfaceId.IsNull && transaction.GetObject(pp.RefSurfaceId, OpenMode.ForRead) is Autodesk.Civil.DatabaseServices.Surface rs)
+              coverDepth = PipeNetworkCommands.CoverAlong(pp, rs, 1.0, minCover).Min;
+            if (!double.IsNaN(coverDepth) && coverDepth < minCover.Value)
             {
               findings.Add(new Dictionary<string, object?>
               {
@@ -813,9 +817,13 @@ public static class QcCommands
           foreach (ObjectId surfId in civilDoc.GetSurfaceIds())
           {
             var surface = CivilObjectUtils.GetRequiredObject<CivilSurface>(transaction, surfId, OpenMode.ForRead);
-            var gp = CivilObjectUtils.InvokeMethod(surface, "GetGeneralProperties");
-            var npts = CivilObjectUtils.GetPropertyValue<int?>(gp, "NumberOfPoints") ?? 0;
-            var ntri = CivilObjectUtils.GetPropertyValue<int?>(gp, "NumberOfTriangles") ?? 0;
+            // C165: an empty surface throws "The surface has no point or triangle" from GetGeneralProperties, which
+            // aborted the whole report (coverage sweep 2026-10-21); it is reported as a surface without points instead.
+            object? gp = null;
+            try { gp = CivilObjectUtils.InvokeMethod(surface, "GetGeneralProperties"); }
+            catch (Exception ex) when (Civil3DCompatibility.UnwrapInvocation(ex).Message.Contains("no point", StringComparison.OrdinalIgnoreCase)) { }
+            var npts = gp == null ? 0 : CivilObjectUtils.GetPropertyValue<int?>(gp, "NumberOfPoints") ?? 0;
+            var ntri = gp == null ? 0 : CivilObjectUtils.GetPropertyValue<int?>(gp, "NumberOfTriangles") ?? 0;
             if (npts == 0)
             {
               sb.AppendLine($"  [ERROR] {surface.Name}: no data points");
@@ -935,7 +943,8 @@ public static class QcCommands
       }
       catch (Exception ex)
       {
-        throw new JsonRpcDispatchException("CIVIL3D.QC_ERROR", $"Error generating QC report: {ex.Message}");
+        PluginLog.Error("Qc", "qcReportGenerate failed", ex);
+        throw new JsonRpcDispatchException("CIVIL3D.QC_ERROR", $"Error generating QC report: {PluginRuntime.DescribeException(ex)}");   // C162: the cause, not the reflection wrapper
       }
     });
   }

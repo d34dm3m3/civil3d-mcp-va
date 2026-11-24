@@ -116,7 +116,7 @@ public static class SurfaceCommands
         {
           ["x"] = x,
           ["y"] = y,
-          ["elevation"] = InvokeSurfaceElevation(surface, x, y),
+          ["elevation"] = ElevationOrNull(surface, x, y),
         });
       }
 
@@ -124,6 +124,7 @@ public static class SurfaceCommands
       {
         ["surfaceName"] = surface.Name,
         ["samples"] = samples,
+        ["outside"] = samples.Count(sample => sample["elevation"] == null),   // C157
         ["units"] = CivilObjectUtils.LinearUnits(database),
       };
     });
@@ -137,7 +138,23 @@ public static class SurfaceCommands
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var surface = CivilObjectUtils.FindSurfaceByName(civilDoc, transaction, name, OpenMode.ForRead);
-      var generalProperties = surface.GetGeneralProperties();
+      // C97: a surface without data has no statistics (Civil 3D throws); it reports 0 points and triangles.
+      if (GeneralPropertiesOrNull(surface) is not { } generalProperties)
+      {
+        return new Dictionary<string, object?>
+        {
+          ["surfaceName"] = surface.Name,
+          ["analysisType"] = analysisType,
+          ["empty"] = true,
+          ["minimumElevation"] = null,
+          ["maximumElevation"] = null,
+          ["meanElevation"] = null,
+          ["area2d"] = null,
+          ["area3d"] = null,
+          ["numberOfPoints"] = 0,
+          ["numberOfTriangles"] = TriangleCount(surface),
+        };
+      }
       var terrainProperties = GetTerrainProperties(surface);
       return new Dictionary<string, object?>
       {
@@ -195,6 +212,28 @@ public static class SurfaceCommands
         ["name"] = name,
         ["deleted"] = true,
       };
+    });
+  }
+
+  /// <summary>C167: renames a surface {name, newName}. Refused (CONFLICT) when another surface already has the new
+  /// name. Profiles keep their own names. Use case (a project, 2026-10-21): the new ground model takes over the name
+  /// bef_mh once the old one is deleted.</summary>
+  public static Task<object?> RenameSurfaceAsync(JsonObject? parameters)
+  {
+    var name = PluginRuntime.GetRequiredString(parameters, "name");
+    var newName = PluginRuntime.GetRequiredString(parameters, "newName");
+    return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var cdoc = (Autodesk.Civil.ApplicationServices.CivilDocument)civilDoc;
+      var surface = CivilObjectUtils.FindSurfaceByName(cdoc, transaction, name, OpenMode.ForWrite);
+      foreach (ObjectId id in cdoc.GetSurfaceIds())
+      {
+        var other = CivilObjectUtils.GetRequiredObject<CivilSurface>(transaction, id, OpenMode.ForRead);
+        if (id != surface.ObjectId && string.Equals(other.Name, newName, StringComparison.OrdinalIgnoreCase))
+          throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"A surface named '{newName}' already exists. Nothing was changed.");
+      }
+      surface.Name = newName;
+      return new Dictionary<string, object?> { ["name"] = new[] { name, surface.Name }, ["handle"] = CivilObjectUtils.GetHandle(surface) };
     });
   }
 
@@ -985,6 +1024,20 @@ public static class SurfaceCommands
     };
   }
 
+  /// <summary>C157: null for a point outside the surface (C13: one such point aborted the whole call with "Point
+  /// Outside Surface"); other errors still fail the call.</summary>
+  private static double? ElevationOrNull(CivilSurface surface, double x, double y)
+  {
+    try
+    {
+      return InvokeSurfaceElevation(surface, x, y);
+    }
+    catch (Exception ex) when (Civil3DCompatibility.UnwrapInvocation(ex).Message.Contains("Outside", StringComparison.OrdinalIgnoreCase))
+    {
+      return null;
+    }
+  }
+
   private static double InvokeSurfaceElevation(CivilSurface surface, double x, double y)
   {
     try
@@ -1008,6 +1061,39 @@ public static class SurfaceCommands
 
   private static int? GetTriangleCount(CivilSurface surface) =>
     surface is TinSurface tinSurface ? tinSurface.GetTinProperties().NumberOfTriangles : null;
+
+  /// <summary>
+  /// C97 (live 2026-10-10): the property getters of a surface without data (a new surface to paste others into) throw
+  /// InvalidOperationException "The surface has no point or triangle". Such a surface has no statistics; null here.
+  /// </summary>
+  internal static GeneralSurfaceProperties? GeneralPropertiesOrNull(CivilSurface surface)
+  {
+    try
+    {
+      return surface.GetGeneralProperties();
+    }
+    catch (InvalidOperationException)
+    {
+      return null;
+    }
+  }
+
+  /// <summary>Points of a surface, 0 for a surface without data (C97).</summary>
+  internal static int PointCount(CivilSurface surface) => GeneralPropertiesOrNull(surface)?.NumberOfPoints ?? 0;
+
+  /// <summary>Triangles of a TIN surface, 0 for one without data (C97); null for other surface types.</summary>
+  internal static int? TriangleCount(CivilSurface surface)
+  {
+    if (surface is not TinSurface tin) return null;
+    try
+    {
+      return tin.GetTinProperties().NumberOfTriangles;
+    }
+    catch (InvalidOperationException)
+    {
+      return 0;
+    }
+  }
 
   private static ObjectId CreateTinSurface(string name, ObjectId styleId) => TinSurface.Create(name, styleId);
 

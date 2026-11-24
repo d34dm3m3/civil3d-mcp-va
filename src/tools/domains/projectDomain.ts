@@ -41,7 +41,23 @@ const canonicalProjectInputShape = {
     "data_shortcut_reference",
     "data_shortcut_sync",
     "data_shortcut_create_reference",
+    "data_shortcut_project_get",
+    "data_shortcut_project_set",
+    "data_shortcut_publish",
+    "external_references_list",
+    "external_reference_set_path",
   ]),
+  workingFolder: z.string().optional(),
+  create: z.boolean().optional(),
+  templatePath: z.string().optional(),
+  associateDrawing: z.boolean().optional(),
+  items: z.array(z.union([z.string(), z.object({ type: z.string().optional(), name: z.string() })])).optional(),
+  all: z.boolean().optional(),
+  listOnly: z.boolean().optional(),
+  handle: z.string().optional(),
+  path: z.string().optional(),
+  makeRelative: z.boolean().optional(),
+  requireExisting: z.boolean().optional(),
   sourceFilePath: z.string().optional(),
   objectName: z.string().optional(),
   objectType: DataShortcutObjectTypeSchema.optional(),
@@ -54,6 +70,32 @@ const canonicalProjectInputShape = {
   shortcutNames: z.array(z.string()).optional(),
   dryRun: z.boolean().optional(),
 };
+
+// C61/C62 (2026-10-08): shortcut project without dialogs, publishing by name, external reference paths
+const DataShortcutProjectGetArgsSchema = z.object({ action: z.literal("data_shortcut_project_get") });
+const DataShortcutProjectSetArgsSchema = z.object({
+  action: z.literal("data_shortcut_project_set"),
+  workingFolder: z.string().optional(),
+  projectFolder: z.string().optional(),
+  create: z.boolean().optional(),
+  description: z.string().optional(),
+  templatePath: z.string().optional(),
+  associateDrawing: z.boolean().optional(),
+});
+const DataShortcutPublishArgsSchema = z.object({
+  action: z.literal("data_shortcut_publish"),
+  items: z.array(z.union([z.string(), z.object({ type: z.string().optional(), name: z.string() })])).optional(),
+  all: z.boolean().optional(),
+  listOnly: z.boolean().optional(),
+});
+const ExternalReferencesListArgsSchema = z.object({ action: z.literal("external_references_list") });
+const ExternalReferenceSetPathArgsSchema = z.object({
+  action: z.literal("external_reference_set_path"),
+  handle: z.string(),
+  path: z.string().optional(),
+  makeRelative: z.boolean().optional(),
+  requireExisting: z.boolean().optional(),
+}).refine((a) => (a.path !== undefined) !== (a.makeRelative === true), { message: "Give either path or makeRelative=true." });
 
 const DataShortcutListArgsSchema = z.object({
   action: z.literal("data_shortcut_list"),
@@ -99,6 +141,82 @@ const DataShortcutCreateReferenceArgsSchema = z.object({
 export const PROJECT_DOMAIN_DEFINITION: DomainToolDefinition = {
   domain: "project",
   actions: {
+    data_shortcut_project_get: {
+      action: "data_shortcut_project_get",
+      inputSchema: DataShortcutProjectGetArgsSchema,
+      responseSchema: GenericProjectResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["getDataShortcutProject"],
+      execute: async () => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("getDataShortcutProject", {}),
+      ),
+    },
+    data_shortcut_project_set: {
+      action: "data_shortcut_project_set",
+      inputSchema: DataShortcutProjectSetArgsSchema,
+      responseSchema: GenericProjectResponseSchema,
+      capabilities: ["manage"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["setDataShortcutProject"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("setDataShortcutProject", {
+          workingFolder: args.workingFolder ?? null,
+          projectFolder: args.projectFolder ?? null,
+          create: args.create ?? false,
+          description: args.description ?? null,
+          templatePath: args.templatePath ?? null,
+          associateDrawing: args.associateDrawing ?? false,
+        }),
+      ),
+    },
+    data_shortcut_publish: {
+      action: "data_shortcut_publish",
+      inputSchema: DataShortcutPublishArgsSchema,
+      responseSchema: GenericProjectResponseSchema,
+      capabilities: ["create", "manage"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["publishDataShortcuts"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("publishDataShortcuts", {
+          items: args.items ?? [],
+          all: args.all ?? false,
+          listOnly: args.listOnly ?? false,
+        }),
+      ),
+    },
+    external_references_list: {
+      action: "external_references_list",
+      inputSchema: ExternalReferencesListArgsSchema,
+      responseSchema: GenericProjectResponseSchema,
+      capabilities: ["query", "inspect"],
+      requiresActiveDrawing: true,
+      safeForRetry: true,
+      pluginMethods: ["listExternalReferences"],
+      execute: async () => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("listExternalReferences", {}),
+      ),
+    },
+    external_reference_set_path: {
+      action: "external_reference_set_path",
+      inputSchema: ExternalReferenceSetPathArgsSchema,
+      responseSchema: GenericProjectResponseSchema,
+      capabilities: ["manage"],
+      requiresActiveDrawing: true,
+      safeForRetry: false,
+      pluginMethods: ["setExternalReferencePath"],
+      execute: async (args) => await withApplicationConnection(
+        async (appClient) => await appClient.sendCommand("setExternalReferencePath", {
+          handle: args.handle,
+          path: args.path ?? null,
+          makeRelative: args.makeRelative ?? false,
+          requireExisting: args.requireExisting ?? true,
+        }),
+      ),
+    },
     data_shortcut_list: {
       action: "data_shortcut_list",
       inputSchema: DataShortcutListArgsSchema,
@@ -207,6 +325,11 @@ export const PROJECT_DOMAIN_DEFINITION: DomainToolDefinition = {
         "data_shortcut_reference",
         "data_shortcut_sync",
         "data_shortcut_create_reference",
+        "data_shortcut_project_get",
+        "data_shortcut_project_set",
+        "data_shortcut_publish",
+        "external_references_list",
+        "external_reference_set_path",
       ],
       resolveAction: (rawArgs) => ({ action: String(rawArgs.action ?? ""), args: rawArgs }),
     },
