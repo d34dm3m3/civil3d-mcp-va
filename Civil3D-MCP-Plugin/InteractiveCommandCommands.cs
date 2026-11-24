@@ -62,4 +62,32 @@ public static class InteractiveCommandCommands
       };
     });
   }
+  /// <summary>
+  /// exportToAutocad {output}: Civil 3D's -EXPORTTOAUTOCAD on the active drawing, a copy (.dwg)
+  /// where Civil objects (pipes, structures, labels, profile views) are exploded to plain AutoCAD objects and xrefs
+  /// bound; the drawing itself is not changed. Queued on the command line like startCommand (answers at once; the
+  /// caller waits for the file). The output must be a new .dwg on a local disk in the export roots (no overwrite, so
+  /// the command never meets an overwrite prompt). Use: machine-control files with all drawing content (labels,
+  /// structures) where it is on the drawing.
+  /// </summary>
+  public static Task<object?> ExportToAutocadAsync(JsonObject? parameters)
+  {
+    var output = FileBoundary.ResolveLocalExportPath(PluginRuntime.GetRequiredString(parameters, "output"), false, ".dwg");
+    if (File.Exists(output))
+      throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"{output} exists. Nothing was started.");
+    if (output.Contains('"'))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "output may not contain quotes. Nothing was started.");
+    return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      doc.SendStringToExecute($"_.-EXPORTTOAUTOCAD\n\n\"{output}\"\n", true, false, false);
+      return new Dictionary<string, object?>
+      {
+        ["started"] = "-EXPORTTOAUTOCAD",
+        ["document"] = doc.Name,
+        ["output"] = output,
+        ["note"] = "Queued; the copy is written when Civil 3D is idle. Wait for the file.",
+      };
+    });
+  }
 }
+

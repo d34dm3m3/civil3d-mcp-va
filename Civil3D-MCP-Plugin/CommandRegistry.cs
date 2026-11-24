@@ -94,6 +94,7 @@ public static class CommandRegistry
     R("copyPartStyle", "PartStyle", W_, (p, ct) => PartStyleCommands.CopyPartStyleAsync(p));
     R("listLayouts", "Layout", R_, (p, ct) => LayoutCommands.ListLayoutsAsync(p));
     R("renameLayouts", "Layout", W_, (p, ct) => LayoutCommands.RenameLayoutsAsync(p));   // C124
+    R("setLayoutOrder", "Layout", W_, (p, ct) => LayoutCommands.SetLayoutOrderAsync(p));   // C187
     R("replaceText", "Layout", W_, (p, ct) => LayoutCommands.ReplaceTextAsync(p));   // C124b
     R("setBlockAttributes", "Layout", W_, (p, ct) => LayoutCommands.SetBlockAttributesAsync(p));
     R("getBlockAttributes", "Layout", R_, (p, ct) => LayoutCommands.GetBlockAttributesAsync(p));
@@ -298,7 +299,6 @@ public static class CommandRegistry
     R("addPipeToNetwork", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.AddPipeToNetworkAsync(p));
     R("resizePipeInNetwork", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ResizePipeInNetworkAsync(p));
     R("setPipeEndElevations", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.SetPipeEndElevationsAsync(p), p));   // C160
-    R("setStructureSize", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.SetStructureSizeAsync(p));   // C172
     R("syncPipeNetwork", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.SyncPipeNetworkAsync(p), p));   // C191
     R("addServiceConnection", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.AddServiceConnectionAsync(p), p));   // C192
     R("gradeGravityNetwork", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.GradeGravityNetworkAsync(p), p));   // C193
@@ -313,6 +313,7 @@ public static class CommandRegistry
     R("networkFittings", "PipeNetwork", R_, (p, ct) => PipeNetworkCommands.NetworkFittingsAsync(p));   // C201
     R("applyRealSizeStructureStyles", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ApplyRealSizeStructureStylesAsync(p));   // C202
     R("trimPipesToStructures", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.TrimPipesToStructuresAsync(p), p));   // C190
+    R("setStructureSize", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.SetStructureSizeAsync(p));   // C172
     R("connectPipesToStructures", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ConnectPipesToStructuresAsync(p));   // C176
     R("setNetworkSurface", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.SetNetworkSurfaceAsync(p), p));   // C166
     R("setStructureRims", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.SetStructureRimsAsync(p), p));   // C123, C160
@@ -449,6 +450,7 @@ public static class CommandRegistry
     R("moveEntities", "ScriptId", W_, (p, ct) => ScriptIdCommands.MoveAsync(p));   // C114
     R("setMLeaderMask", "MLeaderMask", W_, (p, ct) => MLeaderMaskCommands.SetMaskAsync(p));   // C117
     R("startCommand", "InteractiveCommand", W_, (p, ct) => InteractiveCommandCommands.StartAsync(p));   // C118
+    R("exportToAutocad", "InteractiveCommand", W_, (p, ct) => InteractiveCommandCommands.ExportToAutocadAsync(p));   // C188
 
     // Plan production
     R("listSheetSets", "PlanProduction", R_, (p, ct) => PlanProductionCommands.ListSheetSetsAsync());

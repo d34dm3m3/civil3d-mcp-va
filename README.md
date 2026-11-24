@@ -1140,6 +1140,8 @@ This fork of [Sacred-G/Civil3D-mcp](https://github.com/Sacred-G/Civil3D-mcp) (MI
 | `weedProfileViewBandLabels` | Hides overlapping labels in profile view bands (pipe network bands ignore the built-in weeding) |
 | `regenLayouts` | Runs REGENALL on several layouts in one call |
 | `setObjectStyle` `names` | Selects parts by exact name when setting styles |
+| `setLayoutOrder` | Puts the listed layouts last in the tab row in the given order (a rebuilt sheet otherwise lands at the end) |
+| `exportToAutocad` | Writes a copy of the active drawing with Civil objects exploded to plain AutoCAD objects (for machine-control files) |
 
 ---
 

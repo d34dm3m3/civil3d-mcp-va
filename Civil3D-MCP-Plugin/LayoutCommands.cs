@@ -27,6 +27,37 @@ public static class LayoutCommands
   /// <summary>C124: renames layouts: renames [{name, newName}], all checked first (exists, new name free and valid, no
   /// duplicates), then Layout.LayoutName is set. Use case: the sheets were called A1, A1 (2) … and
   /// were to carry their drawing numbers.</summary>
+  /// setLayoutOrder {order: [name, ...]}: the listed layouts are put last in the given order (a rebuilt sheet gets a
+  /// new layout at the end of the tab row); the other layouts keep their order before them. Model is not touched. An
+  /// unknown name or a duplicate changes nothing.
+  public static Task<object?> SetLayoutOrderAsync(JsonObject? parameters)
+  {
+    var list = PluginRuntime.GetParameter(parameters, "order") as JsonArray;
+    if (list == null || list.Count == 0)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "order must list at least one layout name. Nothing was changed.");
+    var names = list.Select((n, i) => n?.GetValue<string>()?.Trim() is string a && a.Length > 0 ? a
+      : throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"order[{i}] must be a layout name. Nothing was changed.")).ToList();
+    if (names.Distinct(StringComparer.OrdinalIgnoreCase).Count() != names.Count)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "order lists a layout twice. Nothing was changed.");
+
+    return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+    {
+      var listed = names.Select(n => FindLayout(database, transaction, n)).ToList();
+      var listedIds = listed.Select(l => l.ObjectId).ToHashSet();
+      var others = Layouts(database, transaction).Where(l => !l.ModelType && !listedIds.Contains(l.ObjectId)).OrderBy(l => l.TabOrder).ToList();
+      var tab = 1;
+      foreach (var layout in others.Concat(listed))
+      {
+        layout.UpgradeOpen();
+        layout.TabOrder = tab++;
+      }
+      return new Dictionary<string, object?>
+      {
+        ["order"] = Layouts(database, transaction).Where(l => !l.ModelType).OrderBy(l => l.TabOrder).Select(l => l.LayoutName).ToList()
+      };
+    });
+  }
+
   public static Task<object?> RenameLayoutsAsync(JsonObject? parameters)
   {
     var list = PluginRuntime.GetParameter(parameters, "renames") as JsonArray;

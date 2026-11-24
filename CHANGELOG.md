@@ -15,6 +15,8 @@ or `civil3d_invoke`.
   pipe against its reference surface.
 - Presentation: `applyRealSizeStructureStyles`, `setObjectStyle` `names`,
   `weedProfileViewBandLabels`, `regenLayouts`.
+- Sheets and exports: `setLayoutOrder` (tab order of layouts), `exportToAutocad`
+  (exploded copy of the drawing through -EXPORTTOAUTOCAD).
 - `setStructureRotation` keeps connected pipe ends: Civil snapped them back to the
   structure centre at their old elevation, so trimmed pipes came back off grade.
   An unchanged angle is no longer set.

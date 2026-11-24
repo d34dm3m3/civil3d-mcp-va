@@ -58,8 +58,8 @@ public static class StructureRotationCommands
   }
 
   /// <summary>C207: sets the rotation without moving pipes. Civil snaps the ends of pipes connected to a rotated
-  /// structure back to its centre and keeps their elevation (live 2026-11-24, Ekerydsplan: rännstensbrunnar's service
-  /// pipes trimmed to the edge came back at the centre 2-11 cm off grade, so every syncPipeNetwork/addServiceConnection
+  /// structure back to its centre and keeps their elevation (live: the service
+  /// pipes of rotated gullies, trimmed to the edge came back at the centre 2-11 cm off grade, so every syncPipeNetwork/addServiceConnection
   /// rerun saw changed geometry). The ends are restored after the rotation; an unchanged angle is not set at all.</summary>
   internal static void SetRotationKeepingPipes(Structure structure, double radians, Transaction transaction)
   {
