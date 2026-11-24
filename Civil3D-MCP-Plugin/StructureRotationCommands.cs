@@ -57,6 +57,33 @@ public static class StructureRotationCommands
     return (null, axes.Count == 0 ? "no connected pipe with a plan length" : $"{axes.Count} pipes connected; give rotationDegrees");
   }
 
+  /// <summary>C207: sets the rotation without moving pipes. Civil snaps the ends of pipes connected to a rotated
+  /// structure back to its centre and keeps their elevation (live 2026-11-24, Ekerydsplan: rännstensbrunnar's service
+  /// pipes trimmed to the edge came back at the centre 2-11 cm off grade, so every syncPipeNetwork/addServiceConnection
+  /// rerun saw changed geometry). The ends are restored after the rotation; an unchanged angle is not set at all.</summary>
+  internal static void SetRotationKeepingPipes(Structure structure, double radians, Transaction transaction)
+  {
+    var diff = Math.Abs(Math.IEEERemainder(structure.Rotation - radians, 2 * Math.PI));
+    if (diff < 1e-9) return;
+    var ends = new List<(Pipe Pipe, Point3d Start, Point3d End)>();
+    var net = transaction.GetObject(structure.NetworkId, OpenMode.ForRead) as Network;
+    if (net != null)
+      foreach (ObjectId id in net.GetPipeIds())
+      {
+        var pipe = (Pipe)transaction.GetObject(id, OpenMode.ForRead);
+        if (pipe.StartStructureId == structure.ObjectId || pipe.EndStructureId == structure.ObjectId)
+          ends.Add((pipe, pipe.StartPoint, pipe.EndPoint));
+      }
+    structure.Rotation = radians;
+    foreach (var (pipe, s0, e0) in ends)
+    {
+      if (pipe.StartPoint.DistanceTo(s0) <= 1e-6 && pipe.EndPoint.DistanceTo(e0) <= 1e-6) continue;
+      if (!pipe.IsWriteEnabled) pipe.UpgradeOpen();
+      if (pipe.StartPoint.DistanceTo(s0) > 1e-6) pipe.StartPoint = s0;
+      if (pipe.EndPoint.DistanceTo(e0) > 1e-6) pipe.EndPoint = e0;
+    }
+  }
+
   /// <summary>Rotates the given structures (open for write) to their pipes; used by structure_rotation_set and
   /// network_build alignStructuresToPipes.</summary>
   internal static (List<Change> Changed, List<Dictionary<string, object?>> Skipped) AlignToPipes(
@@ -77,7 +104,7 @@ public static class StructureRotationCommands
 
       var old = Normalize(structure.Rotation * 180.0 / Math.PI);
       var value = Normalize(direction.Value + offsetDegrees);
-      structure.Rotation = value * Math.PI / 180.0;
+      SetRotationKeepingPipes(structure, value * Math.PI / 180.0, transaction);
       changed.Add(new Change(structure.Name, structure.PartFamilyName, old, Normalize(structure.Rotation * 180.0 / Math.PI), connected.Select(p => p.Name).ToList(), source));
     }
 
@@ -146,7 +173,7 @@ public static class StructureRotationCommands
         foreach (var structure in selected)
         {
           var old = Normalize(structure.Rotation * 180.0 / Math.PI);
-          structure.Rotation = Normalize(rotationDegrees!.Value + offsetDegrees) * Math.PI / 180.0;
+          SetRotationKeepingPipes(structure, Normalize(rotationDegrees!.Value + offsetDegrees) * Math.PI / 180.0, transaction);
           changed.Add(new Change(structure.Name, structure.PartFamilyName, old, Normalize(structure.Rotation * 180.0 / Math.PI),
             (pipes.GetValueOrDefault(structure.ObjectId) ?? new List<(string, Vector2d)>()).Select(p => p.Name).ToList(), "absolute"));
         }

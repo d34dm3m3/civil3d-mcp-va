@@ -1140,3 +1140,11 @@ This fork of [Sacred-G/Civil3D-mcp](https://github.com/Sacred-G/Civil3D-mcp) (MI
 | `weedProfileViewBandLabels` | Hides overlapping labels in profile view bands (pipe network bands ignore the built-in weeding) |
 | `regenLayouts` | Runs REGENALL on several layouts in one call |
 | `setObjectStyle` `names` | Selects parts by exact name when setting styles |
+
+---
+
+## Contributors
+
+- [Steven Bouldin (Sacred-G)](https://github.com/Sacred-G): the original Civil3D-mcp server and plugin
+- [d34dm3m3](https://github.com/d34dm3m3): the water and wastewater fork, tested against live projects
+- Claude (Anthropic): co-author of the fork additions

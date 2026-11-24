@@ -15,6 +15,9 @@ or `civil3d_invoke`.
   pipe against its reference surface.
 - Presentation: `applyRealSizeStructureStyles`, `setObjectStyle` `names`,
   `weedProfileViewBandLabels`, `regenLayouts`.
+- `setStructureRotation` keeps connected pipe ends: Civil snapped them back to the
+  structure centre at their old elevation, so trimmed pipes came back off grade.
+  An unchanged angle is no longer set.
 - Plugin loader with shadow copies for rebuilding while Civil 3D runs, a command
   registry, live smoke tests in `tests/live` (paths through `--folder`/`--template`
   or environment variables).
