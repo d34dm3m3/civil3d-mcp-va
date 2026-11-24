@@ -190,7 +190,7 @@ public static partial class PipeNetworkCommands
           {
             ["upper"] = aOver ? $"{a.Network}/{a.Pipe.Name}" : $"{b.Network}/{b.Pipe.Name}",
             ["lower"] = aOver ? $"{b.Network}/{b.Pipe.Name}" : $"{a.Network}/{a.Pipe.Name}",
-            ["clearance"] = Math.Round(clear, 3), ["ok"] = clear >= minClear,
+            ["clearance"] = Math.Round(clear, 3), ["ok"] = clear >= minClear - 0.0005,   // half a mm: a knee placed at exactly the clearance (C192) rounds to just under it
             ["x"] = Math.Round(x.X, 3), ["y"] = Math.Round(x.Y, 3), ["station"] = st, ["offset"] = off,
           });
         }
