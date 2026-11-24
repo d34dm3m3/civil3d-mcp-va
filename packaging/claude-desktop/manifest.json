@@ -11,11 +11,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Sacred-G/Civil3D-mcp.git"
+    "url": "https://github.com/d34dm3m3/civil3d-mcp-va.git"
   },
-  "homepage": "https://github.com/Sacred-G/Civil3D-mcp",
-  "documentation": "https://github.com/Sacred-G/Civil3D-mcp/blob/main/docs/DEPLOYMENT.md",
-  "support": "https://github.com/Sacred-G/Civil3D-mcp/issues",
+  "homepage": "https://github.com/d34dm3m3/civil3d-mcp-va",
+  "documentation": "https://github.com/d34dm3m3/civil3d-mcp-va/blob/main/docs/DEPLOYMENT.md",
+  "support": "https://github.com/d34dm3m3/civil3d-mcp-va/issues",
   "server": {
     "type": "node",
     "entry_point": "server/index.js",

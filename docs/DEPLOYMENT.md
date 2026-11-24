@@ -83,7 +83,7 @@ on the same HTTP port while the extension is enabled.
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/Sacred-G/Civil3D-mcp.git
+git clone https://github.com/d34dm3m3/civil3d-mcp-va.git
 cd civil3d-mcp
 npm install
 ```
@@ -249,7 +249,7 @@ All variables are optional; defaults work for a standard local setup.
 | `CIVIL3D_CONNECT_TIMEOUT` | `5000` | Connection timeout in milliseconds |
 | `CIVIL3D_COMMAND_TIMEOUT` | `120000` | Timeout for individual command execution (ms) |
 | `CIVIL3D_MAX_RESPONSE_BYTES` | `8388608` | Maximum plugin response buffered by Node.js |
-| `CIVIL3D_ENABLE_TOOL_ALIASES` | `false` | Expose specialized drawing aliases instead of the compact 34-tool surface |
+| `CIVIL3D_ENABLE_TOOL_ALIASES` | `false` | Expose specialized drawing aliases instead of the compact 35-tool surface |
 | `CIVIL3D_APPROVAL_MODE` | enforced | Set to `disabled` only for isolated disposable testing |
 | `CIVIL3D_HELP_ROOT` | Auto-discovered | Optional path to an Autodesk Civil 3D Offline Help `Help` folder |
 | `CIVIL3D_HELP_VERSION` | `2026` | Preferred installed offline-help version |

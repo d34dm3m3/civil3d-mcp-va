@@ -3,6 +3,8 @@
 
   <h1>Civil3D-MCP Server</h1>
 
+  <p><em>civil3d-mcp-va: a fork of <a href="https://github.com/Sacred-G/Civil3D-mcp">Sacred-G/Civil3D-mcp</a> with commands for water and wastewater pipe network design. See <a href="#fork-additions-civil3d-mcp-va">Fork additions</a>.</em></p>
+
   <p><strong>Connect Claude, Cursor, Cline, and other MCP clients directly to a live Autodesk Civil 3D drawing.</strong></p>
   <p>Node.js MCP server + native Civil 3D plugin + workflow automation for grading, hydrology, plan production, QC, and data shortcuts.</p>
 
@@ -11,7 +13,7 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
   [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.29-blueviolet)](https://modelcontextprotocol.io)
   [![Civil 3D](https://img.shields.io/badge/Civil%203D-2026-0696D7?logo=autodesk&logoColor=white)](https://www.autodesk.com/products/civil-3d)
-  [![Issues](https://img.shields.io/github/issues/Sacred-G/Civil3D-mcp)](https://github.com/Sacred-G/Civil3D-mcp/issues)
+  [![Issues](https://img.shields.io/github/issues/d34dm3m3/civil3d-mcp-va)](https://github.com/d34dm3m3/civil3d-mcp-va/issues)
 
   <p>
     <a href="#quick-start">Quick Start</a> •
@@ -45,7 +47,7 @@ This is the **MCP server** (TypeScript). You also need the **Civil 3D .NET plugi
 - **New:** `civil3d_help` searches the locally installed Autodesk Civil 3D help,
   returns cited topics with screenshots, and surfaces matching tutorial videos in chat.
 - The default MCP surface is compact: 34 public tools cover every domain. The
-  complete 219-tool surface can be enabled when a client needs specialized aliases.
+  complete 209-tool surface can be enabled when a client needs specialized aliases.
 - Native workflow handlers cover major QC, grading, hydrology, plan-production,
   and data-shortcut flows instead of relying only on client-side orchestration.
 - Claude Code can be registered with a single project-scoped command that
@@ -127,8 +129,8 @@ For a source-based or Claude Code installation:
 1. Clone and build the Node side:
 
    ```bash
-   git clone https://github.com/Sacred-G/Civil3D-mcp.git
-   cd Civil3D-mcp
+   git clone https://github.com/d34dm3m3/civil3d-mcp-va.git
+   cd civil3d-mcp-va
    npm install
    npm run build
    ```
@@ -300,8 +302,8 @@ narrow transaction; callers never mutate a drawing directly from Node.js.
 ### 1 — Build the MCP Server (TypeScript)
 
 ```bash
-git clone https://github.com/Sacred-G/Civil3D-mcp.git
-cd Civil3D-mcp
+git clone https://github.com/d34dm3m3/civil3d-mcp-va.git
+cd civil3d-mcp-va
 npm install
 npm run build
 ```
@@ -914,7 +916,7 @@ The Node MCP server reads the following variables at startup. All are optional; 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CIVIL3D_ENABLE_TOOL_ALIASES` | `false` | Set to `true` before the MCP server starts to expose all specialized aliases instead of the compact 34-tool surface. |
+| `CIVIL3D_ENABLE_TOOL_ALIASES` | `false` | Set to `true` before the MCP server starts to expose all specialized aliases instead of the compact 35-tool surface. |
 | `CIVIL3D_APPROVAL_MODE` | enforced | Set to `disabled` only in an isolated disposable test environment; production should retain parameter-bound approvals. |
 
 ### Local Autodesk help search
@@ -1075,7 +1077,7 @@ use the default loopback endpoint.
 - Use the corresponding list tool first (e.g. `civil3d_alignment` → `list` action)
 
 **"I cannot see a specialized alias in my MCP client"**
-- This is expected with the recommended compact 34-tool surface
+- This is expected with the recommended compact 35-tool surface
 - Call the canonical domain tool with its `action`, or set `CIVIL3D_ENABLE_TOOL_ALIASES=true` in the MCP server configuration
 - Restart the MCP client connection after changing the environment; changing an unrelated terminal does not update an already-running client-managed server
 - Use `civil3d://catalog/tools` or [tools.generated.md](./docs/tools.generated.md) to map aliases to canonical actions

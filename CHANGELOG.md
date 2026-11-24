@@ -1,5 +1,28 @@
 # Changelog
 
+## civil3d-mcp-va — 2026-11-24 (fork of v1.2.1)
+
+Fork of [Sacred-G/Civil3D-mcp](https://github.com/Sacred-G/Civil3D-mcp) with
+plugin commands for water and wastewater pipe network design. The commands are
+listed under "Fork additions" in the README and reached through the domain tools
+or `civil3d_invoke`.
+
+- Pipe networks: `syncPipeNetwork` (update in place by name),
+  `addServiceConnection`, `gradeGravityNetwork`, `moveStructures`, `splitPipe`,
+  `splitBends`, `trimPipesToStructures`, `linkNetworkPart`/`getNetworkLinks`.
+- Checks and quantities: `networkCrossings`, `pipeCoverAlong`,
+  `networkFittings`; `qcCheckPipeNetwork` minCover now samples cover along the
+  pipe against its reference surface.
+- Presentation: `applyRealSizeStructureStyles`, `setObjectStyle` `names`,
+  `weedProfileViewBandLabels`, `regenLayouts`.
+- Plugin loader with shadow copies for rebuilding while Civil 3D runs, a command
+  registry, live smoke tests in `tests/live` (paths through `--folder`/`--template`
+  or environment variables).
+- Script ids are stored in XData under the application `C3DMCP_ID`.
+- Generated tool reference and version files refreshed; the compact MCP surface
+  has 35 tools, the full alias surface 209.
+- Removed the bundled `templates/Civil_Imperial.dwt`.
+
 ## v1.2.1 — 2026-07-14
 
 ### Production readiness
