@@ -14,6 +14,12 @@ public static partial class PipeNetworkCommands
 {
   private const double TrimMargin = 0.005;
 
+  /// <summary>C206: families without a structure body (break points and fittings in the line). Pipes are not trimmed to
+  /// them (a pipe trimmed away from a valve is disconnected by Civil, live 2026-11-24) and networkCrossings does not
+  /// treat them as structures a pipe can pass through.</summary>
+  internal static readonly HashSet<string> InlineFamilies = new(StringComparer.OrdinalIgnoreCase)
+    { "Brytpunkt", "Null Structure", "Ventil", "Luftning", "Tömning", "Propp", "Spolpost", "Brandpost" };
+
   /// <summary>C190 core: pulls pipe ends connected to a structure back to the structure's edge in plan, elevation along
   /// the pipe's grade; computed from the structure centre so reruns give the same result.</summary>
   private static List<Dictionary<string, object?>> TrimPipeEnds(Dictionary<ObjectId, Structure> structures, IEnumerable<Pipe> pipes,

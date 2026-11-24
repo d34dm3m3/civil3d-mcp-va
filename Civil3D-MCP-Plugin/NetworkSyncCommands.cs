@@ -519,7 +519,7 @@ public static partial class PipeNetworkCommands
         var all = net.GetStructureIds().Cast<ObjectId>().Select(id => CivilObjectUtils.GetRequiredObject<Structure>(transaction, id, OpenMode.ForRead))
           .ToDictionary(s => s.ObjectId);
         var tr = TrimPipeEnds(all, core.Synced, st =>
-          string.Equals(st.PartFamilyName, "Brytpunkt", StringComparison.OrdinalIgnoreCase) ? 0 : st.InnerDiameterOrWidth / 2, false);
+          InlineFamilies.Contains(st.PartFamilyName ?? "") ? 0 : st.InnerDiameterOrWidth / 2, false);
         answer["trimmed"] = tr.Count(t => t.TryGetValue("moved", out var mv) && mv is double v && v > 1e-6);
       }
       return answer;

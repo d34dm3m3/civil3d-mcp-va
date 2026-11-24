@@ -199,7 +199,7 @@ public static partial class PipeNetworkCommands
         foreach (var (sn, s) in structs)
         {
           var r = s.InnerDiameterOrWidth / 2;
-          if (r < 0.01 || string.Equals(s.PartFamilyName, "Brytpunkt", StringComparison.OrdinalIgnoreCase)) continue;   // break points have no body
+          if (r < 0.01 || InlineFamilies.Contains(s.PartFamilyName ?? "")) continue;   // break points and fittings have no body (C206)
           var c = XY(s.Location);
           var sh = s.Handle.ToString();
           var sLink = ReadLink(s)?.HostHandle;
