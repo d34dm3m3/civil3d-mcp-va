@@ -370,11 +370,14 @@ public static partial class PipeNetworkCommands
         return (Math.Max(0, st.InnerDiameterOrWidth / 2), st.Name);
       }
 
+      // C226: locked pipes keep their ends
+      var locked = pipes.Where(IsLocked).Select(p => LockedEntry(p, "trim")).ToList();
+      pipes = pipes.Where(p => !IsLocked(p)).ToList();
       var result = TrimPipeEnds(structures, pipes, st => Radius(st.ObjectId).R, dryRun);
       return new Dictionary<string, object?>
       {
         ["networkName"] = network.Name, ["dryRun"] = dryRun, ["pipes"] = result,
-        ["trimmed"] = result.Count(r => r.TryGetValue("moved", out var m) && m is double v && v > 1e-6),
+        ["trimmed"] = result.Count(r => r.TryGetValue("moved", out var m) && m is double v && v > 1e-6), ["locked"] = locked,
       };
     });
   }

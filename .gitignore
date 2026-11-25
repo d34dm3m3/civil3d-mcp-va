@@ -114,3 +114,5 @@ C_References/
 .mcp.json
 bridge.token
 *.kdbx
+tools/sheetmath_check/out/
+tools/flagplacement_check/out/

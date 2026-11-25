@@ -52,6 +52,8 @@ public static partial class PipeNetworkCommands
       var outlet = structs.Values.FirstOrDefault(s => string.Equals(s.Name, outName, StringComparison.OrdinalIgnoreCase))
         ?? throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Structure '{outName}' is not in '{networkName}'. Nothing was changed.");
       Point2d C(ObjectId id) => XY(structs[id].Location);
+      var lockedIds = new HashSet<ObjectId>(structs.Values.Cast<Part>().Concat(pipes).Where(IsLocked).Select(x => x.ObjectId));
+      var locked = new List<Dictionary<string, object?>>();
       var outInv = new Dictionary<ObjectId, double> { [outlet.ObjectId] = outInvert };   // structure -> outgoing invert
       var outPipe = new Dictionary<ObjectId, Pipe?> { [outlet.ObjectId] = null };
       var pipeInv = new Dictionary<Pipe, (double Down, double Up, double Slope, ObjectId DownS, ObjectId UpS)>();
@@ -81,6 +83,13 @@ public static partial class PipeNetworkCommands
           var L = C(s).GetDistanceTo(C(up));
           var slope = slopes.TryGetValue(p.Name ?? "", out var sl) ? sl : defaultSlope ?? Math.Abs(p.Slope);
           var upInv = down + slope * L;
+          if (lockedIds.Contains(p.ObjectId))
+          {
+            // C226: a locked pipe keeps its inverts; grading goes on upstream from its upstream invert
+            down = InvertAtCentre(p, C(s));
+            upInv = InvertAtCentre(p, C(up));
+            slope = L < 1e-9 ? 0 : (upInv - down) / L;
+          }
           pipeInv[p] = (down, upInv, slope, s, up);
           outInv[up] = upInv;
           outPipe[up] = p;
@@ -93,7 +102,8 @@ public static partial class PipeNetworkCommands
         var a = C(g.DownS); var b = C(g.UpS);
         var zs = ZOnGrade(a, g.Down, b, g.Up, p.StartPoint, p.InnerDiameterOrWidth);
         var ze = ZOnGrade(a, g.Down, b, g.Up, p.EndPoint, p.InnerDiameterOrWidth);
-        if (!dryRun)
+        if (lockedIds.Contains(p.ObjectId)) locked.Add(LockedEntry(p, "grade"));
+        else if (!dryRun)
         {
           p.StartPoint = new Point3d(p.StartPoint.X, p.StartPoint.Y, zs);
           p.EndPoint = new Point3d(p.EndPoint.X, p.EndPoint.Y, ze);
@@ -107,7 +117,8 @@ public static partial class PipeNetworkCommands
         var st = structs[id];
         // sump: the lowest invert at this structure (its outgoing pipe, or the incoming ones at the outlet)
         var low = pipeInv.Where(kv => kv.Value.DownS == id).Select(kv => kv.Value.Down).Append(inv).Min();
-        if (setSumps && !dryRun && Math.Abs(st.SumpElevation - low) > 0.0005)
+        if (lockedIds.Contains(id)) { if (setSumps && Math.Abs(st.SumpElevation - low) > 0.0005) locked.Add(LockedEntry(st, "sump")); }
+        else if (setSumps && !dryRun && Math.Abs(st.SumpElevation - low) > 0.0005)
         {
           st.ControlSumpBy = StructureControlSumpType.ByElevation;
           st.SumpElevation = low;
@@ -117,7 +128,7 @@ public static partial class PipeNetworkCommands
       }
       var ungraded = pipes.Where(p => !pipeInv.ContainsKey(p)).Select(p => p.Name).ToList();
       return new Dictionary<string, object?> { ["networkName"] = network.Name, ["dryRun"] = dryRun, ["structures"] = resultStructs,
-        ["pipes"] = resultPipes, ["ungradedPipes"] = ungraded };
+        ["pipes"] = resultPipes, ["ungradedPipes"] = ungraded, ["locked"] = locked };
     });
   }
 
@@ -150,7 +161,17 @@ public static partial class PipeNetworkCommands
       var network = FindPipeNetworkByName(civilDoc, transaction, networkName, OpenMode.ForRead);
       var surface = NetworkSurface(network, transaction);
       var mode = dryRun ? OpenMode.ForRead : OpenMode.ForWrite;
-      var found = moves.Select(m => (M: m, S: FindStructureByName(network, transaction, m.Name, mode))).ToList();
+      // C226: a locked structure, or one with a locked pipe, is not moved (Civil would move the pipe's end with it)
+      var locked = new List<Dictionary<string, object?>>();
+      var found = new List<((string Name, double? X, double? Y, double? DX, double? DY) M, Structure S)>();
+      foreach (var m in moves)
+      {
+        var s0 = FindStructureByName(network, transaction, m.Name, OpenMode.ForRead);
+        if (IsLocked(s0)) { locked.Add(LockedEntry(s0, "move")); continue; }
+        var lp = PipesAt(network, transaction, s0.ObjectId, OpenMode.ForRead).FirstOrDefault(IsLocked);
+        if (lp != null) { var e = LockedEntry(s0, "move"); e["kind"] = "structure"; e["note"] = $"locked pipe {lp.Name}: {ReadLock(lp)?.Note}"; locked.Add(e); continue; }
+        found.Add((m, FindStructureByName(network, transaction, m.Name, mode)));
+      }
       var result = new List<Dictionary<string, object?>>();
       // Civil moves the connected pipe ends with the structure (to its new centre, connection kept; live 2026-11-24);
       // ends that stopped at the edge (C190) are trimmed again to the distance they had
@@ -186,7 +207,7 @@ public static partial class PipeNetworkCommands
           .ToDictionary(x => x.ObjectId);
         TrimPipeEnds(fresh, affected.Values, x => edge.TryGetValue(x.ObjectId, out var e) && e > 0.001 ? e + TrimMargin : 0, false);
       }
-      return new Dictionary<string, object?> { ["networkName"] = network.Name, ["dryRun"] = dryRun, ["moved"] = result };
+      return new Dictionary<string, object?> { ["networkName"] = network.Name, ["dryRun"] = dryRun, ["moved"] = result, ["locked"] = locked };
     });
   }
 
@@ -319,6 +340,7 @@ public static partial class PipeNetworkCommands
       var network = FindPipeNetworkByName(civilDoc, transaction, networkName, OpenMode.ForWrite);
       var surface = NetworkSurface(network, transaction);
       var result = new List<Dictionary<string, object?>>();
+      var locked = new List<Dictionary<string, object?>>();
       var structures = network.GetStructureIds().Cast<ObjectId>().Select(id => CivilObjectUtils.GetRequiredObject<Structure>(transaction, id, OpenMode.ForRead)).ToList();
       foreach (var st in structures)
       {
@@ -326,6 +348,7 @@ public static partial class PipeNetworkCommands
         if (only != null && !only.Contains(st.Name ?? "", StringComparer.OrdinalIgnoreCase)) continue;
         var ps = PipesAt(network, transaction, st.ObjectId, OpenMode.ForRead);
         if (ps.Count != 2) continue;
+        if (IsLocked(st) || ps.Any(IsLocked)) { locked.Add(LockedEntry(IsLocked(st) ? st : ps.First(IsLocked), "splitBends")); continue; }   // C226
         var V = XY(st.Location);
         Point3d Far(Pipe p) => p.StartStructureId == st.ObjectId ? p.EndPoint : p.StartPoint;
         Point3d Near(Pipe p) => p.StartStructureId == st.ObjectId ? p.StartPoint : p.EndPoint;
@@ -391,7 +414,7 @@ public static partial class PipeNetworkCommands
         entry["created"] = created;
         result.Add(entry);
       }
-      return new Dictionary<string, object?> { ["networkName"] = network.Name, ["dryRun"] = dryRun, ["maxDeg"] = maxDeg, ["split"] = result };
+      return new Dictionary<string, object?> { ["networkName"] = network.Name, ["dryRun"] = dryRun, ["maxDeg"] = maxDeg, ["split"] = result, ["locked"] = locked };
     });
   }
 

@@ -120,6 +120,13 @@ public static class DocumentCommands
     var geoNote = PluginRuntime.GetOptionalString(parameters, "comments");
     var geoTitle = PluginRuntime.GetOptionalString(parameters, "title");
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
+      ConvertDxf(source, output, geoCs, geoX, geoY, geoNote, geoTitle));
+  }
+
+  /// <summary>DXF to DWG through a side database (DxfIn, SaveAs); main thread. C214: also used by xrefAttach convert.</summary>
+  internal static Dictionary<string, object?> ConvertDxf(string source, string output, string? geoCs = null, double? geoX = null, double? geoY = null,
+    string? geoNote = null, string? geoTitle = null)
+  {
     {
       var log = Path.Combine(Path.GetTempPath(), "Civil3DMcp", "dxfin.log");
       Directory.CreateDirectory(Path.GetDirectoryName(log)!);
@@ -171,13 +178,41 @@ public static class DocumentCommands
       side.SaveAs(output, DwgVersion.Current);
       PluginLog.Info("Documents", $"dxfToDwg: '{source}' saved as '{output}'.");
       return new Dictionary<string, object?> { ["source"] = source, ["output"] = output, ["bytes"] = new FileInfo(output).Length, ["modelSpace"] = counts, ["geoLocation"] = geo };
-    });
+    }
   }
 
-  public static Task<object?> ActivateDocumentAsync(JsonObject? parameters)
+  /// <summary>C93 + C209 (2026-11-24): activates an open drawing and answers only when it is active: MdiActiveDocument
+  /// and the document AutoCAD runs calls in are the drawing, it is quiescent, and a command context call runs in it
+  /// (at most settleSeconds, default 15). Use case: scripts slept 3 s after documentActivate (after a documentClose in
+  /// particular), and a write right after a switch could be refused as running in the context of another document.</summary>
+  public static async Task<object?> ActivateDocumentAsync(JsonObject? parameters)
   {
     var (name, path) = Target(parameters, "activated");
-    return CivilExecution.ExecuteInApplicationContextAsync<object?>(() =>
+    var settleSeconds = Math.Clamp(PluginRuntime.GetOptionalDouble(parameters, "settleSeconds") ?? 15, 0, 60);
+    Document? target = null;
+    bool Settled()
+    {
+      var manager = App.DocumentManager;
+      return target != null && Same(manager.MdiActiveDocument, target) && (manager.CurrentDocument == null || Same(manager.CurrentDocument, target))
+        && string.IsNullOrEmpty(target.CommandInProgress) && target.Editor.IsQuiescent;
+    }
+    bool InContext() => target != null && Same(App.DocumentManager.MdiActiveDocument, target)
+      && (App.DocumentManager.CurrentDocument == null || Same(App.DocumentManager.CurrentDocument, target));
+    var (value, settled, waited) = await CivilExecution.ExecuteInApplicationContextThenSettleAsync<Dictionary<string, object?>>(() =>
+    {
+      var r = ActivateCore(name, path);
+      target = Find(name, path, "activated");
+      return r;
+    }, Settled, InContext, "documentActivate", Timeout, TimeSpan.FromSeconds(settleSeconds));
+    value["settled"] = settled;
+    value["settleMs"] = waited;
+    if (!settled && settleSeconds > 0 && value["warnings"] is List<string> warnings)
+      warnings.Add($"'{target?.Name}' did not settle as the active drawing within {settleSeconds:0.#} s; check documents_list before writing.");
+    return value;
+  }
+
+  private static Dictionary<string, object?> ActivateCore(string? name, string? path)
+  {
     {
       var doc = Find(name, path, "activated");
       if (!App.DocumentManager.DocumentActivationEnabled && !Same(App.DocumentManager.MdiActiveDocument, doc))
@@ -192,7 +227,7 @@ public static class DocumentCommands
       result["activeDocument"] = active?.Name;
       result["warnings"] = warnings;
       return result;
-    }, "documentActivate", Timeout);
+    }
   }
 
   public static Task<object?> CloseDocumentAsync(JsonObject? parameters)

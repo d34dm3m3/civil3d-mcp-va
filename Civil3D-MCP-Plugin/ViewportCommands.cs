@@ -50,6 +50,90 @@ public static class ViewportCommands
     return new Point3d(vp.ViewCenter.X, vp.ViewCenter.Y, 0).TransformBy(dcsToWcs);
   }
 
+  /// <summary>C218a (2026-11-24): the model area a viewport shows: its paper rectangle taken to model coordinates
+  /// (a paper offset d from the viewport centre shows the model point centre + R(-twist) d / CustomScale); null when
+  /// the view is degenerate. A non-rectangular clip is not followed (the rectangle is its bounding box on paper).</summary>
+  internal static List<double[]>? ModelPolygon(Viewport vp)
+  {
+    if (!(vp.CustomScale > 0)) return null;
+    Point3d c;
+    try { c = ModelCenter(vp); }
+    catch (Exception ex) when (ex is Autodesk.AutoCAD.Runtime.Exception or ArgumentException or InvalidOperationException) { return null; }
+    var t = -vp.TwistAngle;
+    double cos = Math.Cos(t), sin = Math.Sin(t), hw = vp.Width / 2 / vp.CustomScale, hh = vp.Height / 2 / vp.CustomScale;
+    return new[] { (-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh) }
+      .Select(d => new[] { Math.Round(c.X + d.Item1 * cos - d.Item2 * sin, 3), Math.Round(c.Y + d.Item1 * sin + d.Item2 * cos, 3) })
+      .ToList();
+  }
+
+  internal static bool InPolygon(List<double[]> polygon, double x, double y)
+  {
+    var inside = false;
+    for (int i = 0, j = polygon.Count - 1; i < polygon.Count; j = i++)
+    {
+      double xi = polygon[i][0], yi = polygon[i][1], xj = polygon[j][0], yj = polygon[j][1];
+      if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  /// <summary>C218a: what a viewport shows, for listLayouts: "plan" when an alignment or a pipe network structure lies
+  /// in its model polygon, else "profile" when its centre lies in a profile view (with the profile view's name),
+  /// otherwise "other".</summary>
+  internal static void AddRoles(List<Dictionary<string, object?>> layouts, Autodesk.Civil.ApplicationServices.CivilDocument civilDoc, Transaction transaction)
+  {
+    var profileViews = new List<(string Name, Extents3d E)>();
+    var alignmentPoints = new List<(double X, double Y)>();
+    foreach (ObjectId aid in civilDoc.GetAlignmentIds())
+    {
+      if (transaction.GetObject(aid, OpenMode.ForRead) is not Autodesk.Civil.DatabaseServices.Alignment alignment) continue;
+      foreach (ObjectId pid in alignment.GetProfileViewIds())
+        if (transaction.GetObject(pid, OpenMode.ForRead) is Autodesk.Civil.DatabaseServices.ProfileView pv)
+          try { profileViews.Add((pv.Name, pv.GeometricExtents)); } catch (Autodesk.AutoCAD.Runtime.Exception) { }
+      try
+      {
+        var step = Math.Max((alignment.EndingStation - alignment.StartingStation) / 400, 2.0);
+        for (var st = alignment.StartingStation; st <= alignment.EndingStation; st += step)
+        {
+          double x = 0, y = 0;
+          alignment.PointLocation(st, 0, ref x, ref y);
+          alignmentPoints.Add((x, y));
+        }
+      }
+      catch (Exception) { }
+    }
+    var structurePoints = new List<(double X, double Y)>();
+    foreach (ObjectId nid in civilDoc.GetPipeNetworkIds())
+      if (transaction.GetObject(nid, OpenMode.ForRead) is Autodesk.Civil.DatabaseServices.Network network)
+        foreach (ObjectId sid in network.GetStructureIds())
+          if (transaction.GetObject(sid, OpenMode.ForRead) is Autodesk.Civil.DatabaseServices.Structure structure)
+            structurePoints.Add((structure.Location.X, structure.Location.Y));
+    foreach (var layout in layouts)
+      if (layout["viewports"] is List<Dictionary<string, object?>> viewports)
+        foreach (var vp in viewports)
+        {
+          var polygon = vp["modelPolygon"] as List<double[]>;
+          var centre = vp["modelCenter"] as double[];
+          string role = "other";
+          string? profileView = null;
+          // plan first: a profile view's extents can reach over the plan (live 2026-11-24, a profile view without a
+          // profile spanned the plan area); an alignment or structure in the view makes it a plan
+          if (polygon != null
+              && (alignmentPoints.Any(q => InPolygon(polygon, q.X, q.Y)) || structurePoints.Any(q => InPolygon(polygon, q.X, q.Y))))
+            role = "plan";
+          else if (centre != null)
+            foreach (var (name, e) in profileViews)
+              if (centre[0] >= e.MinPoint.X && centre[0] <= e.MaxPoint.X && centre[1] >= e.MinPoint.Y && centre[1] <= e.MaxPoint.Y)
+              {
+                role = "profile";
+                profileView = name;
+                break;
+              }
+          vp["role"] = role;
+          vp["profileView"] = profileView;
+        }
+  }
+
   internal static Dictionary<string, object?> Describe(Viewport vp, Transaction transaction)
   {
     Point3d? center;
@@ -86,6 +170,7 @@ public static class ViewportCommands
       ["on"] = vp.On,
       ["layer"] = vp.Layer,
       ["frozenLayers"] = frozen,
+      ["modelPolygon"] = ModelPolygon(vp),   // C218a
     };
   }
 
@@ -160,6 +245,22 @@ public static class ViewportCommands
     return ObjectId.Null;
   }
 
+  /// <summary>C218c/C239: the extents of the model space objects whose script id starts with the prefix (null: none).</summary>
+  internal static Extents3d? ModelExtentsByScriptId(Database database, Transaction transaction, string prefix)
+  {
+    Extents3d? all = null;
+    foreach (ObjectId id in (BlockTableRecord)transaction.GetObject(SymbolUtilityServices.GetBlockModelSpaceId(database), OpenMode.ForRead))
+    {
+      if (transaction.GetObject(id, OpenMode.ForRead) is not Entity entity) continue;
+      var sid = ScriptIdCommands.Read(entity).Id;
+      if (sid == null || !sid.StartsWith(prefix, StringComparison.Ordinal)) continue;
+      Extents3d e;
+      try { e = entity.GeometricExtents; } catch (Autodesk.AutoCAD.Runtime.Exception) { continue; }
+      if (all is Extents3d a) { a.AddExtents(e); all = a; } else all = e;
+    }
+    return all;
+  }
+
   public static Task<object?> CreateViewportAsync(JsonObject? parameters)
   {
     var layoutName = PluginRuntime.GetRequiredString(parameters, "layout");
@@ -170,11 +271,61 @@ public static class ViewportCommands
     var args = ReadViewArgs(parameters);
     if (width <= 0 || height <= 0)
       throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "width and height must be > 0 (paper units). Nothing was created.");
-    if (args.CenterX == null || args.ScaleDenominator == null)
-      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "viewCenterX, viewCenterY and scaleDenominator are required for a new viewport. Nothing was created.");
+    // C218c (2026-11-24): fitTo {bbox: {minX, minY, maxX, maxY}} or {idPrefix} (model space objects with that script id)
+    // and margin (model units, default 0): the view centre is the area's centre (in the view's twisted frame), and
+    // without scaleDenominator the scale is the largest whole denominator that shows the area. Use case: detail sheets
+    // computed centre and scale of each view from the drawn objects' extents.
+    var fitTo = PluginRuntime.GetParameter(parameters, "fitTo") as JsonObject;
+    if (fitTo != null && args.CenterX != null)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Give fitTo or viewCenterX/viewCenterY, not both. Nothing was created.");
+    if (fitTo == null && (args.CenterX == null || args.ScaleDenominator == null))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "viewCenterX, viewCenterY and scaleDenominator (or fitTo) are required for a new viewport. Nothing was created.");
+    var fitBox = fitTo?["bbox"] as JsonObject;
+    var fitPrefix = fitTo?["idPrefix"]?.GetValue<string>();
+    var fitMargin = fitTo?["margin"]?.GetValue<double>() ?? 0;
+    if (fitTo != null && (fitBox == null) == (fitPrefix == null))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "fitTo needs bbox {minX, minY, maxX, maxY} or idPrefix. Nothing was created.");
 
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
+      Dictionary<string, object?>? fitted = null;
+      if (fitTo != null)
+      {
+        double minX, minY, maxX, maxY;
+        if (fitBox != null)
+        {
+          double V(string k) => fitBox[k]?.GetValue<double>() ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "fitTo.bbox needs minX, minY, maxX and maxY. Nothing was created.");
+          (minX, minY, maxX, maxY) = (V("minX"), V("minY"), V("maxX"), V("maxY"));
+        }
+        else
+        {
+          var e = ModelExtentsByScriptId(database, transaction, fitPrefix!)
+            ?? throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"No model space object has a script id starting with '{fitPrefix}'. Nothing was created.");
+          (minX, minY, maxX, maxY) = (e.MinPoint.X, e.MinPoint.Y, e.MaxPoint.X, e.MaxPoint.Y);
+        }
+        if (!(maxX > minX || maxY > minY))
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "The area to fit has no extent. Nothing was created.");
+        (minX, minY, maxX, maxY) = (minX - fitMargin, minY - fitMargin, maxX + fitMargin, maxY + fitMargin);
+        // the area in the view's frame: paper x shows the model direction R(-twist) (1, 0)
+        var t = -(args.TwistDegrees ?? 0) * Math.PI / 180.0;
+        double ux = Math.Cos(t), uy = Math.Sin(t), vx = -uy, vy = ux;
+        var corners = new[] { (minX, minY), (maxX, minY), (maxX, maxY), (minX, maxY) };
+        var us = corners.Select(q => q.Item1 * ux + q.Item2 * uy).ToList();
+        var vs = corners.Select(q => q.Item1 * vx + q.Item2 * vy).ToList();
+        double mu = (us.Min() + us.Max()) / 2, mv = (vs.Min() + vs.Max()) / 2, wu = us.Max() - us.Min(), hv = vs.Max() - vs.Min();
+        var centerX = mu * ux + mv * vx;
+        var centerY = mu * uy + mv * vy;
+        var denominator = args.ScaleDenominator
+          ?? Math.Ceiling(Math.Max(wu * args.ModelUnitsInMm / width, hv * args.ModelUnitsInMm / height) - 1e-9);
+        if (!(denominator > 0)) denominator = 1;
+        args = args with { CenterX = centerX, CenterY = centerY, ScaleDenominator = denominator };
+        fitted = new Dictionary<string, object?>
+        {
+          ["area"] = new[] { Math.Round(minX, 3), Math.Round(minY, 3), Math.Round(maxX, 3), Math.Round(maxY, 3) },
+          ["viewCenter"] = new[] { Math.Round(centerX, 3), Math.Round(centerY, 3) }, ["scaleDenominator"] = denominator,
+          ["scaleFromFit"] = PluginRuntime.GetOptionalDouble(parameters, "scaleDenominator") == null,
+        };
+      }
       var layout = LayoutCommands.FindLayout(database, transaction, layoutName);
       if (layout.ModelType)
         throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Viewports go on a paper layout, not Model. Nothing was created.");
@@ -203,6 +354,7 @@ public static class ViewportCommands
 
       var result = Describe(vp, transaction);
       result["layout"] = layout.LayoutName;
+      result["fitted"] = fitted;
       if (warning != null) result["warning"] = warning;
       return result;
     });

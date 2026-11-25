@@ -75,6 +75,7 @@ public static class CommandRegistry
     R("layerStatesList", "LayerStandard", R_, (p, ct) => LayerStandardCommands.ListLayerStatesAsync(p));
     R("layerStateSave", "LayerStandard", W_, (p, ct) => LayerStandardCommands.SaveLayerStateAsync(p));
     R("layerStateRestore", "LayerStandard", W_, (p, ct) => LayerStandardCommands.RestoreLayerStateAsync(p));
+    R("layerStateUpdate", "LayerStandard", W_, (p, ct) => LayerStateUpdateCommands.UpdateLayerStateAsync(p));   // C236
     R("layerStateDelete", "LayerStandard", W_, (p, ct) => LayerStandardCommands.DeleteLayerStateAsync(p));
     R("layersPurge", "LayerStandard", W_, (p, ct) => LayerStandardCommands.PurgeLayersAsync(p));
     R("gridCrossesAdd", "GridCross", W_, (p, ct) => GridCrossCommands.AddGridCrossesAsync(p));
@@ -101,6 +102,12 @@ public static class CommandRegistry
     R("addLayoutText", "Layout", W_, (p, ct) => LayoutCommands.AddLayoutTextAsync(p));
     R("addMLeader", "MLeader", W_, (p, ct) => MLeaderCommands.AddMLeaderAsync(p));
     R("eraseEntities", "EntityQuery", W_, (p, ct) => EntityQueryCommands.EraseEntitiesAsync(p));
+    R("drawEntities", "EntityQuery", W_, (p, ct) => DrawEntitiesCommands.DrawEntitiesAsync(p, ct));   // C223
+    R("addLayoutTable", "Layout", W_, (p, ct) => DrawEntitiesCommands.AddLayoutTableAsync(p, ct));   // C229
+    R("addProfileViewGeometry", "ProfileViewPart", W_, (p, ct) => DrawEntitiesCommands.AddProfileViewGeometryAsync(p, ct));   // C235
+    R("buildDetailSheet", "Layout", W_, (p, ct) => DetailSheetCommands.BuildDetailSheetAsync(p, ct));   // C239
+    R("buildPlanProfileSheet", "Layout", W_, (p, ct) => PlanProfileSheetCommands.BuildPlanProfileSheetAsync(p, ct));   // C240
+    R("placeFlags", "MLeader", W_, (p, ct) => PlaceFlagsCommands.PlaceFlagsAsync(p, ct));   // C241
     R("scaleEntities", "EntityQuery", W_, (p, ct) => EntityQueryCommands.ScaleEntitiesAsync(p));
     R("reverseCurves", "EntityQuery", W_, (p, ct) => EntityQueryCommands.ReverseCurvesAsync(p));   // C145
     R("moveMLeaderText", "EntityQuery", W_, (p, ct) => EntityQueryCommands.MoveMLeaderTextAsync(p));   // C146
@@ -313,6 +320,16 @@ public static class CommandRegistry
     R("networkFittings", "PipeNetwork", R_, (p, ct) => PipeNetworkCommands.NetworkFittingsAsync(p));   // C201
     R("applyRealSizeStructureStyles", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ApplyRealSizeStructureStylesAsync(p));   // C202
     R("trimPipesToStructures", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.TrimPipesToStructuresAsync(p), p));   // C190
+    R("setPartLock", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.SetPartLockAsync(p));   // C226
+    R("getPartLocks", "PipeNetwork", R_, (p, ct) => PipeNetworkCommands.GetPartLocksAsync(p));   // C226
+    R("verifyDrawing", "Qc", R_, (p, ct) => PipeNetworkCommands.VerifyDrawingAsync(p));   // C227
+    R("listServiceConnections", "PipeNetwork", R_, (p, ct) => PipeNetworkCommands.ListServiceConnectionsAsync(p));   // C228
+    R("moveNetworkNode", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.MoveNetworkNodeAsync(p));   // C231
+    R("offsetPipeRun", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.OffsetPipeRunAsync(p, ct));   // C232
+    R("resolveCrossings", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ResolveCrossingsAsync(p, ct));   // C233
+    R("checkNetworkAgainstEntities", "PipeNetwork", R_, (p, ct) => PipeNetworkCommands.CheckNetworkAgainstEntitiesAsync(p));   // C234
+    R("tracePipeChain", "PipeNetwork", R_, (p, ct) => PipeNetworkCommands.TracePipeChainAsync(p));   // C237
+    R("applyChainProfile", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ApplyChainProfileAsync(p, ct));   // C238
     R("setStructureSize", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.SetStructureSizeAsync(p));   // C172
     R("connectPipesToStructures", "PipeNetwork", W_, (p, ct) => PipeNetworkCommands.ConnectPipesToStructuresAsync(p));   // C176
     R("setNetworkSurface", "PipeNetwork", W_, (p, ct) => ProfileViewBandLabelCommands.ThenRefreshBandsAsync(PipeNetworkCommands.SetNetworkSurfaceAsync(p), p));   // C166
@@ -550,21 +567,39 @@ public static class CommandRegistry
     R("listSsaCapabilities", "Stm", R_, (p, ct) => StmCommands.ListSsaCapabilitiesAsync());
 
     // C153: the table itself
+    R("getRules", "Rules", R_, (p, ct) => RulesProfile.GetRulesAsync(p));   // C222
     R("listCommands", "Registry", R_, (p, ct) => Task.FromResult<object?>(Describe(p)));
     return all;
   }
 
-  /// <summary>C153: the commands, optionally filtered by domain or a name fragment.</summary>
+  /// <summary>C153: the commands, optionally filtered by domain or a name fragment. C221: describe: true adds each
+  /// command's parameters, answer fields, the change that last shaped them and a note (CommandDocs; params null for
+  /// commands not described yet).</summary>
   public static Dictionary<string, object?> Describe(JsonObject? parameters)
   {
     var domain = PluginRuntime.GetOptionalString(parameters, "domain");
     var contains = PluginRuntime.GetOptionalString(parameters, "contains");
+    var describe = PluginRuntime.GetOptionalBool(parameters, "describe") ?? false;
     var list = All.Values
       .Where(c => domain == null || string.Equals(c.Domain, domain, StringComparison.OrdinalIgnoreCase))
       .Where(c => contains == null || c.Name.Contains(contains, StringComparison.OrdinalIgnoreCase))
       .OrderBy(c => c.Domain, StringComparer.Ordinal).ThenBy(c => c.Name, StringComparer.Ordinal)
-      .Select(c => new Dictionary<string, object?> { ["name"] = c.Name, ["domain"] = c.Domain, ["kind"] = c.Kind == CommandKind.Read ? "read" : "write" })
+      .Select(c =>
+      {
+        var entry = new Dictionary<string, object?> { ["name"] = c.Name, ["domain"] = c.Domain, ["kind"] = c.Kind == CommandKind.Read ? "read" : "write" };
+        if (describe)
+        {
+          var doc = CommandDocs.All.TryGetValue(c.Name, out var d) ? d : null;
+          entry["params"] = doc?.Params;
+          entry["returns"] = doc?.Returns;
+          entry["since"] = doc?.Since;
+          if (doc?.Note != null) entry["note"] = doc.Note;
+        }
+        return entry;
+      })
       .ToList();
-    return new Dictionary<string, object?> { ["count"] = list.Count, ["total"] = All.Count, ["commands"] = list };
+    var result = new Dictionary<string, object?> { ["count"] = list.Count, ["total"] = All.Count, ["commands"] = list };
+    if (describe) result["described"] = list.Count(e => e["params"] != null);
+    return result;
   }
 }

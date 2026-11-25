@@ -241,7 +241,26 @@ public static class SurfaceCommands
   {
     var name = PluginRuntime.GetRequiredString(parameters, "name");
     var description = PluginRuntime.GetOptionalString(parameters, "description");
-    var points = ParseRequiredPoint3dArray(parameters, "points", "addSurfacePoints requires at least one point.");
+    // C216 (2026-11-24): path (CSV, XYZ or TXT: x y z per line, separated by spaces, tabs, commas or semicolons) instead
+    // of points. Use case: five scripts sent LiDAR and drone points in blocks of 15 000-20 000 through the
+    // bridge.
+    var pathText = PluginRuntime.GetOptionalString(parameters, "path");
+    FilePoints? file = null;
+    Point3dCollection points;
+    if (!string.IsNullOrWhiteSpace(pathText))
+    {
+      if (PluginRuntime.GetParameter(parameters, "points") != null)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Give points or path, not both. Nothing was added.");
+      var columns = (PluginRuntime.GetParameter(parameters, "columns") as JsonArray)?.Select(n => n?.GetValue<int>() ?? -1).ToArray() ?? new[] { 0, 1, 2 };
+      if (columns.Length != 3 || columns.Any(c => c < 0))
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "columns must give the 0-based x, y and z columns, e.g. [1, 2, 3] when the first column is a point number. Nothing was added.");
+      file = ReadPointFile(FileBoundary.ResolveLocalReadPath(pathText!, ".csv", ".xyz", ".txt"), columns);
+      points = file.Points;
+    }
+    else
+    {
+      points = ParseRequiredPoint3dArray(parameters, "points", "addSurfacePoints requires at least one point (points) or a point file (path).");
+    }
 
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
@@ -260,8 +279,56 @@ public static class SurfaceCommands
         ["surfaceName"] = surface.Name,
         ["pointsAdded"] = points.Count,
         ["description"] = surface.Description,
+        ["path"] = file?.Path,
+        ["linesSkipped"] = file?.Skipped,
+        ["firstSkippedLines"] = file?.FirstSkipped,
       };
     });
+  }
+
+  private sealed record FilePoints(string Path, Point3dCollection Points, int Skipped, List<int> FirstSkipped);
+
+  /// <summary>C216: x y z per line; separators space, tab, comma or semicolon. With semicolons (or tabs) a decimal comma
+  /// is accepted; with commas as separators the decimal point is. Lines that do not give three numbers in the chosen
+  /// columns (headers, comments, empty lines) are skipped and counted.</summary>
+  private static FilePoints ReadPointFile(string path, int[] columns)
+  {
+    var points = new Point3dCollection();
+    var skipped = 0;
+    var firstSkipped = new List<int>();
+    var number = 0;
+    var culture = System.Globalization.CultureInfo.InvariantCulture;
+    foreach (var raw in File.ReadLines(path))
+    {
+      number++;
+      var line = raw.Trim();
+      if (line.Length == 0) continue;
+      string[] fields;
+      bool decimalComma;
+      if (line.Contains(';')) { fields = line.Split(';'); decimalComma = true; }
+      else if (line.Contains('\t')) { fields = line.Split('\t'); decimalComma = true; }
+      else if (line.Contains(',') && line.Contains(' ') && !line.Contains(", ")) { fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries); decimalComma = true; }
+      else if (line.Contains(',')) { fields = line.Split(','); decimalComma = false; }
+      else { fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries); decimalComma = false; }
+      double Value(int i)
+      {
+        if (i >= fields.Length) return double.NaN;
+        var text = fields[i].Trim().Trim('"');
+        if (decimalComma) text = text.Replace(',', '.');
+        return double.TryParse(text, System.Globalization.NumberStyles.Float, culture, out var v) ? v : double.NaN;
+      }
+      double x = Value(columns[0]), y = Value(columns[1]), z = Value(columns[2]);
+      if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(z))
+      {
+        skipped++;
+        if (firstSkipped.Count < 5) firstSkipped.Add(number);
+        continue;
+      }
+      points.Add(new Point3d(x, y, z));
+    }
+    if (points.Count == 0)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"'{path}' has no lines with x, y and z in columns {string.Join(", ", columns)} ({skipped} lines skipped). Nothing was added.");
+    return new FilePoints(path, points, skipped, firstSkipped);
   }
 
   public static Task<object?> AddSurfaceBreaklineAsync(JsonObject? parameters)

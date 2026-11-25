@@ -68,7 +68,8 @@ public static class CivilExecution
   /// slot, one start, one continuation for the whole batch instead of one per call. With singleTransaction the calls'
   /// own transactions nest in one outer transaction that commits once at the end (Civil 3D then updates dependent
   /// profile views once, live 5,6 s per committed profile view change) or is aborted when the action says so.</summary>
-  public static async Task<T> ExecuteBatchAsync<T>(Func<Task<(T Result, bool Commit)>> action, bool singleTransaction)
+  public static async Task<T> ExecuteBatchAsync<T>(Func<Task<(T Result, bool Commit)>> action, bool singleTransaction,
+    Func<T, bool, Task>? afterCommit = null)
   {
     if (InBatch)
       throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "A batch cannot contain another batch.");
@@ -100,6 +101,8 @@ public static class CivilExecution
             if (commit) outer.Commit();
             else outer.Abort();
           }
+          // C210: a step after the calls (batch save), still in the batch's command context and after the outer commit
+          if (afterCommit != null) await afterCommit(value, commit);
         }
         catch (Exception ex)
         {
@@ -309,6 +312,66 @@ public static class CivilExecution
     }
     var cancellationToken = PluginRuntime.GetCurrentRequestCancellationToken();
     return await ExecuteSerializedAsync(() => ApplicationContextQueue.RunAsync(action, trace, timeout, cancellationToken)).ConfigureAwait(false);
+  }
+
+  /// <summary>
+  /// C209 (2026-11-24): runs <paramref name="action"/> in the application context like
+  /// <see cref="ExecuteInApplicationContextAsync{T}"/>, then, still holding the host gate, waits until
+  /// <paramref name="settled"/> holds in the application context (checked every 100 ms) and a command context call
+  /// runs in the document it names (AutoCAD switches the command context after MdiActiveDocument changes; a write
+  /// that came too early was refused as "running in the context of another document"). Returns the action's result
+  /// and how long the wait took; settled is false when the timeout passed first.
+  /// </summary>
+  public static async Task<(T Result, bool Settled, long WaitedMs)> ExecuteInApplicationContextThenSettleAsync<T>(
+    Func<T> action, Func<bool> settled, Func<bool> inCommandContext, string trace, TimeSpan timeout, TimeSpan settleTimeout)
+  {
+    if (InBatch)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"{trace} runs in the Civil 3D application context (documents are switched or closed there) and cannot be part of a batch. Nothing more was run.");
+    var cancellationToken = PluginRuntime.GetCurrentRequestCancellationToken();
+    return await ExecuteSerializedAsync(async () =>
+    {
+      var result = await ApplicationContextQueue.RunAsync(action, trace, timeout, cancellationToken).ConfigureAwait(false);
+      var timer = System.Diagnostics.Stopwatch.StartNew();
+      var ok = false;
+      while (timer.Elapsed < settleTimeout)
+      {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (await ApplicationContextQueue.RunAsync(settled, trace + " (settle)", settleTimeout, cancellationToken).ConfigureAwait(false))
+        {
+          ok = true;
+          break;
+        }
+        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+      }
+      if (ok)
+      {
+        // The command context probe: the next request's call runs in the same kind of context.
+        var state = new ContextState();
+        var callbackDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var probe = false;
+        var context = RunInCommandContextAsync(() =>
+        {
+          if (Interlocked.CompareExchange(ref state.Value, Running, NotStarted) != NotStarted) return;
+          try { probe = inCommandContext(); }
+          catch (Exception ex) { PluginLog.Warn("Execution", $"{trace}: settle probe failed: {ex.Message}"); }
+          finally
+          {
+            Volatile.Write(ref state.Value, Finished);
+            callbackDone.TrySetResult();
+          }
+        });
+        try
+        {
+          await AwaitContextAsync(context, state, callbackDone.Task).ConfigureAwait(false);
+        }
+        catch (JsonRpcDispatchException ex)
+        {
+          PluginLog.Warn("Execution", $"{trace}: settle probe not run: {ex.Message}");
+        }
+        ok = probe;
+      }
+      return (result, ok, timer.ElapsedMilliseconds);
+    }).ConfigureAwait(false);
   }
 
   /// <summary>

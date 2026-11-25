@@ -29,10 +29,11 @@ public static class PlotCommands
   /// <summary>Output path inside the export roots (FileBoundary: CIVIL3D_EXPORT_ROOTS, canonical, no reparse points)
   /// with the given extension; the folder must exist; an existing file only with overwrite. C65 (2026-10-09): was any
   /// local path, so a localhost client could overwrite any .pdf/.png the user owns (security review 2026-10-08).</summary>
-  private static string ResolveOutput(JsonObject? parameters, params string[] extensions)
+  private static string ResolveOutput(JsonObject? parameters, params string[] extensions) =>
+    ResolveOutputPath(PluginRuntime.GetRequiredString(parameters, "output"), PluginRuntime.GetOptionalBool(parameters, "overwrite") ?? false, extensions);
+
+  private static string ResolveOutputPath(string output, bool overwrite, params string[] extensions)
   {
-    var output = PluginRuntime.GetRequiredString(parameters, "output");
-    var overwrite = PluginRuntime.GetOptionalBool(parameters, "overwrite") ?? false;
     var full = FileBoundary.ResolveExportPath(output, overwrite, extensions);
     if (!Directory.Exists(Path.GetDirectoryName(full)))
       throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"The folder of '{full}' does not exist. Nothing was plotted.");
@@ -221,12 +222,28 @@ public static class PlotCommands
   }
 
   /// <summary>Plots a paper layout to .pdf (1:1, layout limits, the layout's paper or the closest DWG To PDF
-  /// size) or .png (layout limits scaled to fit a raster size).</summary>
+  /// size) or .png (layout limits scaled to fit a raster size).
+  /// C219 (2026-11-24): layouts [names] plots several layouts in one command (output: an existing folder, files
+  /// "layout.pdf", or a path with {layout}); png {dpi} also plots each layout to a PNG beside the PDF, on the PNG
+  /// device's raster size closest to the paper at that resolution (a PNG rendered from the PDF would need a PDF
+  /// renderer, which neither AutoCAD's API nor .NET has without a new dependency). Use case: 13 scripts plotted layout by
+  /// layout, then made PNGs from the PDFs in Python.</summary>
   public static Task<object?> PlotLayoutAsync(JsonObject? parameters)
   {
-    var layoutName = PluginRuntime.GetRequiredString(parameters, "layout");
-    var full = ResolveOutput(parameters, ".pdf", ".png");
-    var pdf = full.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+    var many = PluginRuntime.GetParameter(parameters, "layouts") as JsonArray;
+    var single = PluginRuntime.GetOptionalString(parameters, "layout");
+    if ((many == null) == (single == null))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Give layout (one) or layouts (a list), not both. Nothing was plotted.");
+    var overwrite = PluginRuntime.GetOptionalBool(parameters, "overwrite") ?? false;
+    var output = PluginRuntime.GetRequiredString(parameters, "output");
+    var png = PluginRuntime.GetParameter(parameters, "png") as JsonObject;
+    double? pngDpi = null;
+    if (png != null)
+    {
+      pngDpi = png["dpi"]?.GetValue<double>() ?? 150;
+      if (!(pngDpi >= 30 && pngDpi <= 1200))
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "png.dpi must be 30-1200. Nothing was plotted.");
+    }
     var media = PluginRuntime.GetOptionalString(parameters, "media");
     var styleSheet = PluginRuntime.GetOptionalString(parameters, "plotStyleTable");
     var pageSetupName = PluginRuntime.GetOptionalString(parameters, "pageSetup");
@@ -236,149 +253,263 @@ public static class PlotCommands
     if (regen is not ("all" or "current" or "none"))
       throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"regen must be all, current or none, not '{regen}'. Nothing was plotted.");
 
+    var jobs = new List<(string Layout, string Full, string? Png)>();
+    if (single != null)
+    {
+      var full = ResolveOutput(parameters, ".pdf", ".png");
+      jobs.Add((single, full, PngBeside(full, png != null, overwrite)));
+    }
+    else
+    {
+      var names = many!.Select(n => n?.GetValue<string>()?.Trim() ?? "").Where(n => n.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+      if (names.Count == 0 || names.Count > 50)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "layouts must list 1-50 layout names. Nothing was plotted.");
+      var placeholder = output.Contains("{layout}", StringComparison.OrdinalIgnoreCase);
+      if (!placeholder && !Directory.Exists(output))
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"With layouts, output is an existing folder or a path with {{layout}}; '{output}' is neither. Nothing was plotted.");
+      foreach (var name in names)
+      {
+        var safe = string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+        var path = placeholder ? output.Replace("{layout}", safe, StringComparison.OrdinalIgnoreCase) : Path.Combine(output, safe + ".pdf");
+        var full = ResolveOutputPath(path, overwrite, ".pdf", ".png");
+        jobs.Add((name, full, PngBeside(full, png != null, overwrite)));
+      }
+    }
+    if (pageSetupName != null && jobs.Any(j => !j.Full.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "pageSetup plots to PDF only. Nothing was plotted.");
+
     return CivilExecution.WriteInCommandAsync<object?>((doc, civilDoc, database, transaction) =>
     {
-      var layout = LayoutCommands.FindLayout(database, transaction, layoutName);
-      if (layout.ModelType)
-        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "layout_plot plots a paper layout; use view_png for model space. Nothing was plotted.");
+      // every layout is checked before the first plot
+      foreach (var job in jobs)
+        if (LayoutCommands.FindLayout(database, transaction, job.Layout).ModelType)
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "layout_plot plots a paper layout; use view_png for model space. Nothing was plotted.");
+      var results = new List<Dictionary<string, object?>>();
+      foreach (var job in jobs)
+      {
+        var pdf = job.Full.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+        var result = PlotOne(doc, database, transaction, job.Layout, job.Full, pdf, media, styleSheet, pageSetupName, regen, pdf ? null : pngDpi);
+        if (job.Png != null)
+          result["png"] = PlotOne(doc, database, transaction, job.Layout, job.Png, false, null, styleSheet, null, "none", pngDpi);
+        results.Add(result);
+      }
+      if (single != null) return results[0];
+      return new Dictionary<string, object?> { ["plotted"] = results.Count, ["results"] = results };
+    }, "plotLayout", TimeSpan.FromSeconds(single != null ? 100 : 110));
+  }
 
-      using var settings = new PlotSettings(false);
-      settings.CopyFrom(layout);
-      var validator = PlotSettingsValidator.Current;
-      var device = pdf ? PdfDevice : PngDevice;
-      validator.SetPlotConfigurationName(settings, device, null);
-      validator.RefreshLists(settings);
+  /// <summary>C219: the PNG beside a PDF output (same name), inside the export roots; null when no PNG is wanted or the
+  /// output is a PNG already.</summary>
+  private static string? PngBeside(string full, bool wanted, bool overwrite)
+  {
+    if (!wanted || !full.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)) return null;
+    return ResolveOutputPath(Path.ChangeExtension(full, ".png"), overwrite, ".png");
+  }
 
-      // A page setup copied from the layout may be centred (window/extents setups); centring is invalid for
-      // PlotType.Layout, so it is cleared first where AutoCAD allows it.
+  /// <summary>C219: the union of the extents of what is drawn on a layout (its own paper space viewport left out), in
+  /// paper units; null when nothing has extents.</summary>
+  private static (double Width, double Height)? SheetExtents(Layout layout, Transaction transaction)
+  {
+    double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
+    var first = true;
+    foreach (ObjectId id in (BlockTableRecord)transaction.GetObject(layout.BlockTableRecordId, OpenMode.ForRead))
+    {
+      if (transaction.GetObject(id, OpenMode.ForRead) is not Entity entity) continue;
+      if (entity is Viewport && first) { first = false; continue; }
       try
       {
-        validator.SetPlotCentered(settings, false);
+        var e = entity.GeometricExtents;
+        (minX, minY, maxX, maxY) = (Math.Min(minX, e.MinPoint.X), Math.Min(minY, e.MinPoint.Y), Math.Max(maxX, e.MaxPoint.X), Math.Max(maxY, e.MaxPoint.Y));
       }
-      catch (Autodesk.AutoCAD.Runtime.Exception)
-      {
-        // already a Layout plot: nothing to clear
-      }
+      catch (Autodesk.AutoCAD.Runtime.Exception) { }
+    }
+    return maxX > minX && maxY > minY ? (maxX - minX, maxY - minY) : null;
+  }
 
-      string chosenName, chosenLocale, plotArea = "layout";
-      string? scaleText = null;
-      if (pageSetupName != null)
-      {
-        // C72: plot exactly as a named page setup says (paper, pen table, scale such as 1:2, rotation).
-        if (!pdf) throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "pageSetup plots to PDF only. Nothing was plotted.");
-        var setups = (DBDictionary)transaction.GetObject(database.PlotSettingsDictionaryId, OpenMode.ForRead);
-        if (!setups.Contains(pageSetupName))
-          throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Page setup '{pageSetupName}' was not found. Nothing was plotted.");
-        var named = (PlotSettings)transaction.GetObject(setups.GetAt(pageSetupName), OpenMode.ForRead);
-        if (!string.Equals(named.PlotConfigurationName, PdfDevice, StringComparison.OrdinalIgnoreCase))
-          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"Page setup '{pageSetupName}' uses '{named.PlotConfigurationName}', not {PdfDevice}. Nothing was plotted.");
-        settings.CopyFrom(named);
-        validator.SetPlotConfigurationName(settings, PdfDevice, named.CanonicalMediaName);
-        chosenName = named.CanonicalMediaName;
-        chosenLocale = validator.GetLocaleMediaName(settings, chosenName);
-        scaleText = named.UseStandardScale ? named.StdScaleType.ToString()
-          : $"1:{(named.CustomPrintScale.Denominator / named.CustomPrintScale.Numerator).ToString("0.###", CultureInfo.InvariantCulture)}";
-        // C151: the page setup's own pen table unless plotStyleTable is given (was always the page setup's: a grey
-        // plot of a colour page setup came out in colour, 2026-10-12).
-      }
-      else if (pdf)
-      {
-        var names = validator.GetCanonicalMediaNameList(settings).Cast<string>().ToList();
-        if (media != null)
-        {
-          chosenName = names.FirstOrDefault(n => string.Equals(n, media, StringComparison.OrdinalIgnoreCase)
-              || string.Equals(validator.GetLocaleMediaName(settings, n), media, StringComparison.OrdinalIgnoreCase))
-            ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"Unknown media '{media}' for {PdfDevice}. Nothing was plotted.");
-        }
-        else if (names.Contains(layout.CanonicalMediaName, StringComparer.OrdinalIgnoreCase))
-        {
-          chosenName = names.First(n => string.Equals(n, layout.CanonicalMediaName, StringComparison.OrdinalIgnoreCase));
-        }
-        else
-        {
-          // The layout uses another device: the DWG To PDF size closest to its paper (PlotPaperSize is in mm).
-          validator.SetClosestMediaName(settings, layout.PlotPaperSize.X, layout.PlotPaperSize.Y, PlotPaperUnit.Millimeters, false);
-          chosenName = settings.CanonicalMediaName;
-        }
+  /// <summary>C219: the width of the layout's paper in mm along the plotted area's long side (the limits can be larger
+  /// than the paper, live 2026-11-24: an A3 layout's limits were 840 mm wide).</summary>
+  private static double PaperWidthMm(Layout layout, double aspect)
+  {
+    double a = layout.PlotPaperSize.X, b = layout.PlotPaperSize.Y;
+    if (!(a > 0 && b > 0)) return layout.Limits.MaxPoint.X - layout.Limits.MinPoint.X;
+    return aspect >= 1 ? Math.Max(a, b) : Math.Min(a, b);
+  }
 
-        chosenLocale = validator.GetLocaleMediaName(settings, chosenName);
-        validator.SetPlotConfigurationName(settings, PdfDevice, chosenName);
-        validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Layout);
-        validator.SetUseStandardScale(settings, true);
-        validator.SetStdScaleType(settings, StdScaleType.StdScale1To1);
+  /// <summary>C219: the PNG raster size closest to the wanted pixel width with an aspect within 5 % of the area plotted;
+  /// otherwise the closest aspect, then width.</summary>
+  private static Media ChoosePngMediaForDpi(List<Media> sizes, double aspect, double width)
+  {
+    var close = sizes.Where(s => s.Height > 0 && Math.Abs(Math.Log(s.Width / s.Height / aspect)) < 0.05).ToList();
+    return close.Count > 0
+      ? close.OrderBy(s => Math.Abs(s.Width - width)).First()
+      : sizes.Where(s => s.Height > 0).OrderBy(s => Math.Abs(Math.Log(s.Width / s.Height / aspect))).ThenBy(s => Math.Abs(s.Width - width)).First();
+  }
+
+  private static Dictionary<string, object?> PlotOne(Document doc, Database database, Transaction transaction, string layoutName, string full, bool pdf,
+    string? media, string? styleSheet, string? pageSetupName, string regen, double? pngDpi)
+  {
+    var layout = LayoutCommands.FindLayout(database, transaction, layoutName);
+    if (layout.ModelType)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "layout_plot plots a paper layout; use view_png for model space. Nothing was plotted.");
+
+    using var settings = new PlotSettings(false);
+    settings.CopyFrom(layout);
+    var validator = PlotSettingsValidator.Current;
+    var device = pdf ? PdfDevice : PngDevice;
+    validator.SetPlotConfigurationName(settings, device, null);
+    validator.RefreshLists(settings);
+
+    // A page setup copied from the layout may be centred (window/extents setups); centring is invalid for
+    // PlotType.Layout, so it is cleared first where AutoCAD allows it.
+    try
+    {
+      validator.SetPlotCentered(settings, false);
+    }
+    catch (Autodesk.AutoCAD.Runtime.Exception)
+    {
+      // already a Layout plot: nothing to clear
+    }
+
+    string chosenName, chosenLocale, plotArea = "layout";
+    double? sheetWidth = null;
+    string? scaleText = null;
+    if (pageSetupName != null)
+    {
+      // C72: plot exactly as a named page setup says (paper, pen table, scale such as 1:2, rotation).
+      if (!pdf) throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "pageSetup plots to PDF only. Nothing was plotted.");
+      var setups = (DBDictionary)transaction.GetObject(database.PlotSettingsDictionaryId, OpenMode.ForRead);
+      if (!setups.Contains(pageSetupName))
+        throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Page setup '{pageSetupName}' was not found. Nothing was plotted.");
+      var named = (PlotSettings)transaction.GetObject(setups.GetAt(pageSetupName), OpenMode.ForRead);
+      if (!string.Equals(named.PlotConfigurationName, PdfDevice, StringComparison.OrdinalIgnoreCase))
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"Page setup '{pageSetupName}' uses '{named.PlotConfigurationName}', not {PdfDevice}. Nothing was plotted.");
+      settings.CopyFrom(named);
+      validator.SetPlotConfigurationName(settings, PdfDevice, named.CanonicalMediaName);
+      chosenName = named.CanonicalMediaName;
+      chosenLocale = validator.GetLocaleMediaName(settings, chosenName);
+      scaleText = named.UseStandardScale ? named.StdScaleType.ToString()
+        : $"1:{(named.CustomPrintScale.Denominator / named.CustomPrintScale.Numerator).ToString("0.###", CultureInfo.InvariantCulture)}";
+      // C151: the page setup's own pen table unless plotStyleTable is given (was always the page setup's: a grey
+      // plot of a colour page setup came out in colour, 2026-10-12).
+    }
+    else if (pdf)
+    {
+      var names = validator.GetCanonicalMediaNameList(settings).Cast<string>().ToList();
+      if (media != null)
+      {
+        chosenName = names.FirstOrDefault(n => string.Equals(n, media, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(validator.GetLocaleMediaName(settings, n), media, StringComparison.OrdinalIgnoreCase))
+          ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"Unknown media '{media}' for {PdfDevice}. Nothing was plotted.");
+      }
+      else if (names.Contains(layout.CanonicalMediaName, StringComparer.OrdinalIgnoreCase))
+      {
+        chosenName = names.First(n => string.Equals(n, layout.CanonicalMediaName, StringComparison.OrdinalIgnoreCase));
       }
       else
       {
-        var sizes = PngSizes(validator, settings);
-        if (sizes.Count == 0)
-          throw new JsonRpcDispatchException("CIVIL3D.UNSUPPORTED", $"{PngDevice} lists no raster sizes. Nothing was plotted.");
-        var limits = layout.Limits;
-        var aspect = (limits.MaxPoint.X - limits.MinPoint.X) / Math.Max(limits.MaxPoint.Y - limits.MinPoint.Y, 1e-9);
-        var chosen = media == null ? ChoosePngMedia(sizes, aspect)
-          : FindMedia(sizes, media) ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"Unknown media '{media}'. Available: {string.Join(", ", sizes.Select(s => s.Locale))}. Nothing was plotted.");
-        chosenName = chosen.Name;
-        chosenLocale = chosen.Locale;
-        // Device and media first, then area, scale and rotation. Centring is refused for PlotType.Layout
-        // (eInvalidInput live 2026-10-07), so the layout limits are scaled to fit without it; should AutoCAD
-        // refuse fit-to-paper for Layout too, the extents are plotted scaled to fit and centred instead.
-        validator.SetPlotConfigurationName(settings, PngDevice, chosenName);
-        validator.SetPlotRotation(settings, PlotRotation.Degrees000);
-        try
-        {
-          validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Layout);
-          validator.SetUseStandardScale(settings, true);
-          validator.SetStdScaleType(settings, StdScaleType.ScaleToFit);
-          plotArea = "layout";
-        }
-        catch (Autodesk.AutoCAD.Runtime.Exception)
-        {
-          validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Extents);
-          validator.SetUseStandardScale(settings, true);
-          validator.SetStdScaleType(settings, StdScaleType.ScaleToFit);
-          validator.SetPlotCentered(settings, true);
-          plotArea = "extents";
-        }
+        // The layout uses another device: the DWG To PDF size closest to its paper (PlotPaperSize is in mm).
+        validator.SetClosestMediaName(settings, layout.PlotPaperSize.X, layout.PlotPaperSize.Y, PlotPaperUnit.Millimeters, false);
+        chosenName = settings.CanonicalMediaName;
       }
 
-      ApplyStyleSheet(validator, settings, styleSheet);
-
-      // Viewports are only drawn for the current layout: make it current while plotting, then switch back.
-      var manager = LayoutManager.Current;
-      var previous = manager.CurrentLayout;
-      var switched = !string.Equals(previous, layout.LayoutName, StringComparison.OrdinalIgnoreCase);
-      string regenDone = "none";
-      if (switched) manager.CurrentLayout = layout.LayoutName;
-      try
+      chosenLocale = validator.GetLocaleMediaName(settings, chosenName);
+      validator.SetPlotConfigurationName(settings, PdfDevice, chosenName);
+      validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Layout);
+      validator.SetUseStandardScale(settings, true);
+      validator.SetStdScaleType(settings, StdScaleType.StdScale1To1);
+    }
+    else
+    {
+      var sizes = PngSizes(validator, settings);
+      if (sizes.Count == 0)
+        throw new JsonRpcDispatchException("CIVIL3D.UNSUPPORTED", $"{PngDevice} lists no raster sizes. Nothing was plotted.");
+      var limits = layout.Limits;
+      var aspect = (limits.MaxPoint.X - limits.MinPoint.X) / Math.Max(limits.MaxPoint.Y - limits.MinPoint.Y, 1e-9);
+      // C219: with png.dpi the sheet's drawn extents are plotted (the layout limits can be larger than the sheet, live
+      // 2026-11-24: an A3 sheet filled a quarter of the PNG), on the raster size closest to that resolution
+      if (pngDpi != null && SheetExtents(layout, transaction) is { } sheet)
       {
-        // C57: regenerate before plotting. Live 2026-10-07 a profile view's surface profile (view dependent
-        // graphics) was missing on most sheets plotted right after their viewports were made; a regen draws it.
-        regenDone = Regenerate(doc, regen);
-        RunEngine(doc, new PlotInfo { Layout = layout.ObjectId, OverrideSettings = settings }, full);
+        sheetWidth = sheet.Width;
+        aspect = sheet.Width / Math.Max(sheet.Height, 1e-9);
       }
-      finally
+      var chosen = media == null ? (pngDpi is double dpi ? ChoosePngMediaForDpi(sizes, aspect, (sheetWidth ?? PaperWidthMm(layout, aspect)) / 25.4 * dpi) : ChoosePngMedia(sizes, aspect))
+        : FindMedia(sizes, media) ?? throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"Unknown media '{media}'. Available: {string.Join(", ", sizes.Select(s => s.Locale))}. Nothing was plotted.");
+      chosenName = chosen.Name;
+      chosenLocale = chosen.Locale;
+      // Device and media first, then area, scale and rotation. Centring is refused for PlotType.Layout
+      // (eInvalidInput live 2026-10-07), so the layout limits are scaled to fit without it; should AutoCAD
+      // refuse fit-to-paper for Layout too, the extents are plotted scaled to fit and centred instead.
+      validator.SetPlotConfigurationName(settings, PngDevice, chosenName);
+      validator.SetPlotRotation(settings, PlotRotation.Degrees000);
+      if (sheetWidth != null)
       {
-        if (switched) manager.CurrentLayout = previous;
+        validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Extents);
+        validator.SetUseStandardScale(settings, true);
+        validator.SetStdScaleType(settings, StdScaleType.ScaleToFit);
+        validator.SetPlotCentered(settings, true);
+        plotArea = "extents";
       }
-
-      var blank = pdf ? null : PngIsUniform(full);
-      var result = new Dictionary<string, object?>
+      else try
       {
-        ["layout"] = layout.LayoutName,
-        ["output"] = full,
-        ["bytes"] = new FileInfo(full).Length,
-        ["device"] = device,
-        ["media"] = chosenLocale,
-        ["plotStyleTable"] = settings.CurrentStyleSheet,
-        ["scale"] = scaleText ?? (pdf ? "1:1" : "fit"),
-        ["pageSetup"] = pageSetupName,
-        ["regen"] = regenDone,
-        ["plotArea"] = plotArea,
-        ["plotRotation"] = settings.PlotRotation.ToString(),
-        ["blank"] = blank,
-      };
-      if (blank == true) result["warning"] = "The PNG has a single colour: nothing visible was plotted.";
-      return result;
-    }, "plotLayout", TimeSpan.FromSeconds(100));
+        validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Layout);
+        validator.SetUseStandardScale(settings, true);
+        validator.SetStdScaleType(settings, StdScaleType.ScaleToFit);
+        plotArea = "layout";
+      }
+      catch (Autodesk.AutoCAD.Runtime.Exception)
+      {
+        validator.SetPlotType(settings, Autodesk.AutoCAD.DatabaseServices.PlotType.Extents);
+        validator.SetUseStandardScale(settings, true);
+        validator.SetStdScaleType(settings, StdScaleType.ScaleToFit);
+        validator.SetPlotCentered(settings, true);
+        plotArea = "extents";
+      }
+    }
+
+    ApplyStyleSheet(validator, settings, styleSheet);
+
+    // Viewports are only drawn for the current layout: make it current while plotting, then switch back.
+    var manager = LayoutManager.Current;
+    var previous = manager.CurrentLayout;
+    var switched = !string.Equals(previous, layout.LayoutName, StringComparison.OrdinalIgnoreCase);
+    string regenDone = "none";
+    if (switched) manager.CurrentLayout = layout.LayoutName;
+    try
+    {
+      // C57: regenerate before plotting. Live 2026-10-07 a profile view's surface profile (view dependent
+      // graphics) was missing on most sheets plotted right after their viewports were made; a regen draws it.
+      regenDone = Regenerate(doc, regen);
+      RunEngine(doc, new PlotInfo { Layout = layout.ObjectId, OverrideSettings = settings }, full);
+    }
+    finally
+    {
+      if (switched) manager.CurrentLayout = previous;
+    }
+
+    var blank = pdf ? null : PngIsUniform(full);
+    var result = new Dictionary<string, object?>
+    {
+      ["layout"] = layout.LayoutName,
+      ["output"] = full,
+      ["bytes"] = new FileInfo(full).Length,
+      ["device"] = device,
+      ["media"] = chosenLocale,
+      ["plotStyleTable"] = settings.CurrentStyleSheet,
+      ["scale"] = scaleText ?? (pdf ? "1:1" : "fit"),
+      ["pageSetup"] = pageSetupName,
+      ["regen"] = regenDone,
+      ["plotArea"] = plotArea,
+      ["plotRotation"] = settings.PlotRotation.ToString(),
+      ["blank"] = blank,
+    };
+    if (blank == true) result["warning"] = "The PNG has a single colour: nothing visible was plotted.";
+    if (!pdf && pngDpi is double usedDpi)
+    {
+      var mm = sheetWidth ?? PaperWidthMm(layout, (layout.Limits.MaxPoint.X - layout.Limits.MinPoint.X) / Math.Max(layout.Limits.MaxPoint.Y - layout.Limits.MinPoint.Y, 1e-9));
+      result["dpiRequested"] = usedDpi;
+      result["dpi"] = mm > 0 && Pixels.Match(chosenLocale) is { Success: true } px ? Math.Round(double.Parse(px.Groups[1].Value, CultureInfo.InvariantCulture) / (mm / 25.4), 1) : null;
+    }
+    return result;
   }
 
   /// <summary>C151: REGENALL (all viewports) through the document's COM object, synchronously inside the plot command

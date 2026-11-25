@@ -22,6 +22,9 @@ internal static class FileBoundary
   private static readonly Lazy<string[]> ImportRoots = new(() => LoadRoots(ImportRootsVariable));
   private static readonly Lazy<string[]> ExportRoots = new(() => LoadRoots(ExportRootsVariable));
 
+  /// <summary>C222: the configured import roots (the rule profile is looked up in them).</summary>
+  internal static IReadOnlyList<string> ImportRootPaths => ImportRoots.Value;
+
   public static string ResolveImportPath(string rawPath, params string[] allowedExtensions)
   {
     var path = ResolvePath(rawPath, ImportRoots.Value, "import", allowedExtensions);

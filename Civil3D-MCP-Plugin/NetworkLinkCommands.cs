@@ -124,10 +124,61 @@ public static partial class PipeNetworkCommands
     var minClear = PluginRuntime.GetOptionalDouble(parameters, "minClearance") ?? 0.10;
     var withStructures = PluginRuntime.GetOptionalBool(parameters, "includeStructures") ?? true;
     var limit = Math.Clamp(PluginRuntime.GetOptionalInt(parameters, "limit") ?? 500, 1, 5000);
+    // C220 (2026-11-24): rules [{upper, lower, clearance}] give the required clearance per pair of networks (names, *
+    // as a wildcard: "V*", "*-serv"); the first rule whose upper and lower match the crossing's upper and lower network
+    // applies (either: true also matches the pair the other way round), else minClearance. Each crossing reports
+    // required and the rule's index. Use case: 25 scripts checked their own pair rules on the crossings in
+    // Python.
+    var rules = ReadCrossingRules(PluginRuntime.GetParameter(parameters, "rules") as JsonArray, "rules");
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var names = networks is { Count: > 0 } ? networks : ListPipeNetworkNames(civilDoc, transaction);
       var nets = names.Select(n => FindPipeNetworkByName(civilDoc, transaction, n, OpenMode.ForRead)).ToList();
+      Alignment? al = string.IsNullOrWhiteSpace(alignmentName) ? null : CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName!);
+      var (sorted, through) = ComputeCrossings(transaction, nets, rules, minClear, withStructures, al);
+      return new Dictionary<string, object?>
+      {
+        ["networks"] = names, ["minClearance"] = minClear, ["rules"] = rules.Count, ["crossings"] = sorted.Take(limit).ToList(), ["crossingCount"] = sorted.Count,
+        ["underMinClearance"] = sorted.Count(c => !(bool)c["ok"]!), ["pipesThroughStructures"] = through,
+      };
+    });
+  }
+
+  internal sealed record CrossingRule(string Upper, string Lower, double Clearance, bool Either);
+
+  /// <summary>C220 rules [{upper, lower, clearance, either?}] (network names, * as a wildcard).</summary>
+  internal static List<CrossingRule> ReadCrossingRules(JsonArray? ruleList, string what)
+  {
+    var rules = new List<CrossingRule>();
+    if (ruleList != null)
+      foreach (var (node, i) in ruleList.Select((n, i) => (n, i)))
+      {
+        if (node is not JsonObject r || r["upper"]?.GetValue<string>() is not { Length: > 0 } up || r["lower"]?.GetValue<string>() is not { Length: > 0 } low
+            || r["clearance"]?.GetValue<double>() is not double need || !double.IsFinite(need))
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"{what}[{i}] must be {{upper, lower, clearance (m), either?}}.");
+        rules.Add(new CrossingRule(up, low, need, r["either"]?.GetValue<bool>() ?? false));
+      }
+    return rules;
+  }
+
+  /// <summary>A network name against a pattern with * as a wildcard, case-insensitive.</summary>
+  internal static bool NetworkNameMatch(string pattern, string name) =>
+    System.Text.RegularExpressions.Regex.IsMatch(name, "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*") + "$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+  /// <summary>C200/C220 core (shared with C227 verifyDrawing): the plan crossings between the pipes of the networks with
+  /// the required clearance per rule, sorted by clearance, and the pipes through structure bodies.</summary>
+  private static (List<Dictionary<string, object?>> Crossings, List<Dictionary<string, object?>> Through) ComputeCrossings(Transaction transaction,
+    List<Network> nets, List<CrossingRule> rules, double minClear, bool withStructures, Alignment? al)
+  {
+    (double Need, int? Rule) Required(string upper, string lower)
+    {
+      for (var i = 0; i < rules.Count; i++)
+      {
+        var r = rules[i];
+        if ((NetworkNameMatch(r.Upper, upper) && NetworkNameMatch(r.Lower, lower)) || (r.Either && NetworkNameMatch(r.Upper, lower) && NetworkNameMatch(r.Lower, upper))) return (r.Clearance, i);
+      }
+      return (minClear, null);
+    }
       var pipes = new List<XPipe>();
       var structs = new List<(string Network, Structure S)>();
       foreach (var net in nets)
@@ -164,7 +215,6 @@ public static partial class PipeNetworkCommands
         return h;
       }
       var own = pipes.ToDictionary(x => x.Pipe.ObjectId, x => Own(x.Pipe));
-      Alignment? al = string.IsNullOrWhiteSpace(alignmentName) ? null : CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName!);
       (double? St, double? Off) Station(Point2d q)
       {
         if (al == null) return (null, null);
@@ -186,11 +236,14 @@ public static partial class PipeNetworkCommands
           var aOver = za > zb;
           var clear = aOver ? (za - ra) - (zb + rb) : (zb - rb) - (za + ra);
           var (st, off) = Station(x);
+          var (need, rule) = Required(aOver ? a.Network : b.Network, aOver ? b.Network : a.Network);
           crossings.Add(new Dictionary<string, object?>
           {
             ["upper"] = aOver ? $"{a.Network}/{a.Pipe.Name}" : $"{b.Network}/{b.Pipe.Name}",
             ["lower"] = aOver ? $"{b.Network}/{b.Pipe.Name}" : $"{a.Network}/{a.Pipe.Name}",
-            ["clearance"] = Math.Round(clear, 3), ["ok"] = clear >= minClear - 0.0005,   // half a mm: a knee placed at exactly the clearance (C192) rounds to just under it
+            ["upperNetwork"] = aOver ? a.Network : b.Network, ["lowerNetwork"] = aOver ? b.Network : a.Network,   // C227
+            ["clearance"] = Math.Round(clear, 3), ["ok"] = clear >= need - 0.0005,   // half a mm: a knee placed at exactly the clearance (C192) rounds to just under it
+            ["required"] = need, ["rule"] = rule,   // C220
             ["x"] = Math.Round(x.X, 3), ["y"] = Math.Round(x.Y, 3), ["station"] = st, ["offset"] = off,
           });
         }
@@ -219,13 +272,7 @@ public static partial class PipeNetworkCommands
               ["overlapPlan"] = Math.Round(-d, 3), ["pipeZ"] = Math.Round(z, 3), ["x"] = Math.Round(q.X, 3), ["y"] = Math.Round(q.Y, 3), ["station"] = st });
           }
         }
-      var sorted = crossings.OrderBy(c => (double)c["clearance"]!).ToList();
-      return new Dictionary<string, object?>
-      {
-        ["networks"] = names, ["minClearance"] = minClear, ["crossings"] = sorted.Take(limit).ToList(), ["crossingCount"] = sorted.Count,
-        ["underMinClearance"] = sorted.Count(c => !(bool)c["ok"]!), ["pipesThroughStructures"] = through,
-      };
-    });
+      return (crossings.OrderBy(c => (double)c["clearance"]!).ToList(), through);
   }
 
   // ---------- C201 networkFittings ----------

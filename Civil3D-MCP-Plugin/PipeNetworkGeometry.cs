@@ -158,6 +158,16 @@ public static partial class PipeNetworkCommands
     return invA + (invB - invA) * t + inner / 2;
   }
 
+  /// <summary>C226: a pipe's invert at the projection of a point (a structure centre) on its line, extrapolated along its
+  /// grade: the invert a locked pipe gives the structure.</summary>
+  private static double InvertAtCentre(Pipe pipe, Point2d c)
+  {
+    var a = XY(pipe.StartPoint);
+    var v = XY(pipe.EndPoint) - a;
+    var t = v.LengthSqrd < 1e-12 ? 0 : (c - a).DotProduct(v) / v.LengthSqrd;
+    return pipe.StartPoint.Z + (pipe.EndPoint.Z - pipe.StartPoint.Z) * t - pipe.InnerDiameterOrWidth / 2;
+  }
+
   internal static (double Min, double AtStation, double ShareBelow, int Samples) CoverAlong(Pipe pipe, CivilSurface surface, double step, double? minCover)
   {
     var a = pipe.StartPoint; var b = pipe.EndPoint;

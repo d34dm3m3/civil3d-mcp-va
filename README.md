@@ -1142,6 +1142,41 @@ This fork of [Sacred-G/Civil3D-mcp](https://github.com/Sacred-G/Civil3D-mcp) (MI
 | `setObjectStyle` `names` | Selects parts by exact name when setting styles |
 | `setLayoutOrder` | Puts the listed layouts last in the tab row in the given order (a rebuilt sheet otherwise lands at the end) |
 | `exportToAutocad` | Writes a copy of the active drawing with Civil objects exploded to plain AutoCAD objects (for machine-control files) |
+| `documentActivate` (C209) | Answers only when the activated drawing is really active, so the next call does not run in the previous drawing |
+| `batch` `save` (C210) | Saves the drawing after a batch in which no call failed |
+| `id` / `idData` on creating commands (C211) | Every creating command (polyline, hatch, circle, text, block, leader and so on) can tag what it creates with a script id |
+| `eraseEntities` selectors (C212) | Erases by script id prefix, layer and layout besides handles, with a dry run |
+| `layersImport` `rows` (C213) | Creates or updates layers from rows in the call, without a temporary CSV file |
+| `xrefAttach` (C214) | Attaches a DWG or DXF reference (a DXF is converted first) and can reload or skip one that is already attached |
+| `getPipeNetwork` (C215) | Reports each pipe's nominal size and outer radius and each structure's inverts per connected pipe |
+| `addSurfacePoints` `path` (C216) | Adds points to a surface straight from a CSV, XYZ or TXT point file |
+| `layerStateRestore` `properties` (C217) | Restores only the chosen layer properties, so a state can leave colours alone |
+| `listLayouts` / viewports (C218) | Gives each viewport its plan polygon in model coordinates and its role (plan, profile or other) |
+| `plotLayout` `layouts` (C219) | Plots several layouts to PDF (and optionally PNG) in one call |
+| `networkCrossings` `rules` (C220) | Requires a clearance per pair of networks (wildcard names) and reports which rule each crossing was judged by |
+| `listCommands` `describe` (C221) | Adds each command's parameters, answer fields and the change that last shaped them |
+| `getRules` (C222) | Reads the design rule profile (company base plus municipal overrides, see `docs/rules/rules_profile.example.json`); `profile: true` fills omitted values of the network commands from it |
+| `drawEntities` (C223) | Draws a set of plain AutoCAD entities as a rerunnable state under a script id prefix, keeping hand-moved items |
+| `syncPipeNetwork` spec (C224) | Builds networks from polylines, inserted structures and outlets with depth and slope rules, in one declarative call |
+| `addServiceConnection` (C225) | Adds water services, inlets of existing pipes into new structures, several connections per call and pruning of stale service parts |
+| `setPartLock` / `getPartLocks` (C226) | Locks network parts in the drawing so that recomputing commands leave them as they are |
+| `verifyDrawing` (C227) | Checks the networks against the rule profile and the source rules (free ends, pipes through structures, crossings, cover, slope, bends) |
+| `listServiceConnections` (C228) | Lists the service connections of a drawing as data: host part, connection point and station, dimension and end structure |
+| `addLayoutTable` (C229) | Draws a table of lines and texts in a layout or model space from columns and rows |
+| `civil3d_request_approval` `scope: "run"` (C230) | Issues one reusable approval token for a run of writes against a single drawing |
+| `moveNetworkNode` (C231) | Moves a structure or free pipe end together with everything attached to it, including linked services |
+| `offsetPipeRun` (C232) | Lays a run of pipes parallel to a reference run at a fixed centre-to-centre distance |
+| `resolveCrossings` (C233) | Resolves crossings that lack clearance with a knee or by lowering one pipe end |
+| `checkNetworkAgainstEntities` (C234) | Measures the distance from network parts to entities on given layers or blocks, also in references and side databases |
+| `addProfileViewGeometry` (C235) | Draws entities in profile views from station and elevation instead of model coordinates |
+| `layerStateUpdate` (C236) | Changes chosen properties of chosen layers in saved layer states and leaves the rest of the states as they were |
+| `tracePipeChain` (C237) | Follows an unbranched run of pipes and reports stations, bends and crossings along it |
+| `applyChainProfile` (C238) | Applies a profile (station and elevation) to a run of pipes, splitting at break points and merging straight segments |
+| `buildDetailSheet` (C239) | Builds a detail sheet with views, a scale per view, the right column's legend and the title block's attributes |
+| `buildPlanProfileSheet` (C240) | Builds a plan and profile sheet from an alignment and a profile view: twisted plan viewport, profile viewport, match lines and frames |
+| `placeFlags` (C241) | Places label flags (multileaders) free of texts, network parts and each other, as one rerunnable call |
+
+The rule profile is a JSON file whose keys are the format the commands read (they are Swedish because the profile came from a Swedish practice). `docs/rules/rules_profile.example.json` and `docs/rules/source_rules.example.json` describe every key the plugin reads, with illustrative values.
 
 ---
 

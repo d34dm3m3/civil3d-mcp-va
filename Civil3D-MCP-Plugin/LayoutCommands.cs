@@ -161,6 +161,7 @@ public static class LayoutCommands
         result.Add(DescribeLayout(layout, transaction));
       }
 
+      ViewportCommands.AddRoles(result, civilDoc, transaction);   // C218a: role per viewport
       return new Dictionary<string, object?> { ["layouts"] = result };
     });
   }
@@ -219,18 +220,28 @@ public static class LayoutCommands
   {
     var name = PluginRuntime.GetRequiredString(parameters, "name").Trim();
     var copyFrom = PluginRuntime.GetRequiredString(parameters, "copyFrom");
+    // C218b (2026-11-24): replace: true replaces an existing layout of that name with a fresh copy and keeps its tab
+    // position (copy to a temporary name, delete the old, rename, set the tab order). Use case: the sheet script deleted and
+    // recreated sheets, which then moved last in the tab row (C187 setLayoutOrder put them back).
+    var replace = PluginRuntime.GetOptionalBool(parameters, "replace") ?? false;
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       // Checks through an open/close transaction, so nothing is held open when LayoutManager writes.
       string sourceName;
+      string? replacedName = null;
+      var replacedTab = -1;
       using (var check = database.TransactionManager.StartOpenCloseTransaction())
       {
-        if (Layouts(database, check).Any(l => string.Equals(l.LayoutName, name, StringComparison.OrdinalIgnoreCase)))
-          throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"Layout '{name}' already exists. Nothing was changed.");
+        var existing = Layouts(database, check).FirstOrDefault(l => string.Equals(l.LayoutName, name, StringComparison.OrdinalIgnoreCase));
+        if (existing != null && !replace)
+          throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"Layout '{name}' already exists (replace: true replaces it). Nothing was changed.");
+        if (existing != null && existing.ModelType)
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Model cannot be replaced. Nothing was changed.");
         var source = FindLayout(database, check, copyFrom);
         if (source.ModelType)
           throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "copyFrom must be a paper layout, not Model. Nothing was changed.");
         sourceName = source.LayoutName;
+        if (existing != null) (replacedName, replacedTab) = (existing.LayoutName, existing.TabOrder);
         check.Commit();
       }
 
@@ -244,10 +255,28 @@ public static class LayoutCommands
       }
 
       var manager = LayoutManager.Current;
-      manager.CloneLayout(sourceName, name, manager.LayoutCount);
+      if (replacedName != null)
+      {
+        var temporary = "C218-" + Guid.NewGuid().ToString("N")[..12];
+        manager.CloneLayout(sourceName, temporary, manager.LayoutCount);
+        if (string.Equals(manager.CurrentLayout, replacedName, StringComparison.OrdinalIgnoreCase)) manager.CurrentLayout = temporary;
+        manager.DeleteLayout(replacedName);
+        manager.RenameLayout(temporary, name);
+        var placed = FindLayout(database, transaction, name);
+        if (placed.TabOrder != replacedTab)
+        {
+          placed.UpgradeOpen();
+          placed.TabOrder = replacedTab;
+        }
+      }
+      else
+      {
+        manager.CloneLayout(sourceName, name, manager.LayoutCount);
+      }
       var created = FindLayout(database, transaction, name);
       var result = DescribeLayout(created, transaction);
       result["copiedFrom"] = sourceName;
+      result["replaced"] = replacedName != null;
       return result;
     });
   }
@@ -500,7 +529,12 @@ public static class LayoutCommands
     var x = PluginRuntime.GetRequiredDouble(parameters, "x");
     var y = PluginRuntime.GetRequiredDouble(parameters, "y");
     var height = PluginRuntime.GetOptionalDouble(parameters, "height") ?? 2.5;
-    var width = PluginRuntime.GetOptionalDouble(parameters, "width") ?? 0.0;
+    // C218d (2026-11-24): wrapWidth = the MText width at which lines wrap (same as width, the name the scripts use);
+    // the answer gives the text's real size (actualWidth, actualHeight, bottomY for the next text below). Use case:
+    // right column notes estimated their height from 0.68 x height per character.
+    var width = PluginRuntime.GetOptionalDouble(parameters, "wrapWidth") ?? PluginRuntime.GetOptionalDouble(parameters, "width") ?? 0.0;
+    if (width < 0)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "wrapWidth (width) must be 0 (no wrapping) or positive. Nothing was changed.");
     var layer = PluginRuntime.GetOptionalString(parameters, "layer");
     // C77: rotation, text style and fields (AutoCAD field codes such as %<\AcVar Filename>% in the text become a
     // live field, evaluated at plot). Use case: the company template's plot stamp (file, layout, plot date) in the margin.
@@ -575,10 +609,13 @@ public static class LayoutCommands
         field.Evaluate();
         shown = mtext.Text;
       }
+      double? bottomY = null;
+      try { bottomY = Math.Round(mtext.GeometricExtents.MinPoint.Y, 3); } catch (Autodesk.AutoCAD.Runtime.Exception) { }
       return new Dictionary<string, object?>
       {
         ["layout"] = layoutName, ["handle"] = mtext.Handle.ToString(), ["layer"] = mtext.Layer,
         ["field"] = hasFields, ["shown"] = shown,
+        ["wrapWidth"] = width, ["actualWidth"] = Math.Round(mtext.ActualWidth, 3), ["actualHeight"] = Math.Round(mtext.ActualHeight, 3), ["bottomY"] = bottomY,
       };
     });
   }

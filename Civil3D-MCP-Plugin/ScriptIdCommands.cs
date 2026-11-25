@@ -58,7 +58,7 @@ public static class ScriptIdCommands
     return ((string)values[1].Value, string.IsNullOrEmpty(data) ? null : data);
   }
 
-  private static void EnsureApp(Database database, Transaction transaction) => XDataApps.Ensure(database, transaction, App);
+  internal static void EnsureApp(Database database, Transaction transaction) => XDataApps.Ensure(database, transaction, App);
 
   public static Task<object?> SetAsync(JsonObject? parameters)
   {
@@ -82,18 +82,79 @@ public static class ScriptIdCommands
       var written = new List<Dictionary<string, object?>>();
       foreach (var (it, entity) in entities)
       {
-        entity.UpgradeOpen();
-        var values = new List<TypedValue> { new((int)DxfCode.ExtendedDataRegAppName, App), new((int)DxfCode.ExtendedDataAsciiString, it.Id) };
-        if (it.Data != null)
-          for (var i = 0; i < it.Data.Length; i += Chunk)
-            values.Add(new TypedValue((int)DxfCode.ExtendedDataAsciiString, it.Data.Substring(i, Math.Min(Chunk, it.Data.Length - i))));
-        using var buffer = new ResultBuffer(values.ToArray());
-        entity.XData = buffer;
-        RemoveIds(entity, keepCurrent: true);   // C205: an id under an earlier application name goes
+        Write(entity, it.Id, it.Data);
         written.Add(new Dictionary<string, object?> { ["handle"] = entity.Handle.ToString(), ["id"] = it.Id, ["dataLength"] = it.Data?.Length ?? 0 });
       }
       return new Dictionary<string, object?> { ["written"] = written };
     });
+  }
+
+  /// <summary>Writes the script id (and data) on an entity; the application must be registered (EnsureApp).</summary>
+  internal static void Write(DBObject entity, string id, string? data)
+  {
+    if (!entity.IsWriteEnabled) entity.UpgradeOpen();
+    var values = new List<TypedValue> { new((int)DxfCode.ExtendedDataRegAppName, App), new((int)DxfCode.ExtendedDataAsciiString, id) };
+    if (data != null)
+      for (var i = 0; i < data.Length; i += Chunk)
+        values.Add(new TypedValue((int)DxfCode.ExtendedDataAsciiString, data.Substring(i, Math.Min(Chunk, data.Length - i))));
+    using var buffer = new ResultBuffer(values.ToArray());
+    entity.XData = buffer;
+    RemoveIds(entity, keepCurrent: true);   // C205: an id under an earlier application name goes
+  }
+
+  /// <summary>C211: the commands that create drawing objects and take an optional script id (id, idData) in their
+  /// parameters; CommandDispatcher writes the id after the command, also inside a batch.</summary>
+  internal static readonly HashSet<string> CreatingCommands = new(StringComparer.Ordinal)
+  {
+    "createPolyline", "createHatch", "createCircle", "createText", "createMText", "createLineSegment", "createPoints",
+    "createDimension", "addMLeader", "insertBlock", "addLayoutText",
+  };
+
+  /// <summary>C211: the id and data a creating command was given, checked before the command runs (null: none given).</summary>
+  internal static (string Id, string? Data)? ReadRequested(JsonObject? parameters)
+  {
+    var idNode = parameters?["id"];
+    if (idNode == null) return null;
+    if (idNode is not JsonValue v || !v.TryGetValue<string>(out var id) || id.Length == 0 || id.Length > 255)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "id must be a text of 1-255 characters (the script id, C3DMCP_ID). Nothing was created.");
+    var data = parameters!["idData"] switch { null => null, JsonValue dv when dv.TryGetValue<string>(out var s) => s, var other => other.ToJsonString() };
+    return (id, data);
+  }
+
+  /// <summary>C211: writes the script id on the objects a creating command reports (handle, lineId or handles) and adds
+  /// id (and idData) to its answer. Runs as its own write after the command (inline inside a batch). Should the write
+  /// fail, the objects stay created and the answer says why under idError.</summary>
+  internal static async Task<object?> TagCreatedAsync(object? result, string id, string? data)
+  {
+    if (result is not Dictionary<string, object?> answer) return result;
+    var handles = new List<string>();
+    foreach (var key in new[] { "handle", "lineId" })
+      if (answer.TryGetValue(key, out var h) && h is string text && text.Length > 0) handles.Add(text);
+    if (answer.TryGetValue("handles", out var list) && list is IEnumerable<string> many) handles.AddRange(many.Where(t => !string.IsNullOrEmpty(t)));
+    handles = handles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    if (handles.Count == 0)
+    {
+      answer["idError"] = "the command reported no handle, so no id was written";
+      return answer;
+    }
+    try
+    {
+      await CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
+      {
+        var entities = handles.Select(h => Find(database, transaction, h)).ToList();
+        EnsureApp(database, transaction);
+        foreach (var entity in entities) Write(entity, id, data);
+        return null;
+      });
+      answer["id"] = id;
+      if (data != null) answer["idData"] = data;
+      if (handles.Count > 1) answer["idHandles"] = handles;
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+      answer["idError"] = ex is JsonRpcDispatchException ? ex.Message : PluginRuntime.DescribeException(ex);
+    }
+    return answer;
   }
 
   public static Task<object?> ClearAsync(JsonObject? parameters)

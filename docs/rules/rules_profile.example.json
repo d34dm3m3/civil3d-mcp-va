@@ -1,0 +1,105 @@
+// Example rule profile for getRules and the commands that take `profile: true` (or `kommun`).
+// Copy it as rules_profile.json into <import root>\Rules, into the folder in C3DMCP_RULES_DIR,
+// or pass its path as rulesPath. Comments and trailing commas are allowed.
+//
+// The keys are the file format the plugin reads; they are Swedish because the profile came from a
+// Swedish practice. The values below are illustrative, not design advice: use your own standards.
+// Units: metres, millimetres where the key ends in Mm, per mille where it ends in Permille/Promille,
+// degrees where it ends in Grader.
+//
+// "bas" applies everywhere; "kommuner.<key>" overrides single keys for one municipality (objects merge
+// key by key, anything else, lists too, is replaced). The municipality is the kommun parameter, else
+// the first folder of the drawing's path, from the drawing upwards, that matches a key below
+// (diacritics, case, spaces and dashes do not matter). Keys the commands look for but the profile
+// lacks are listed under notInProfile in the answer; explicit parameters always win.
+{
+  "schema": { "version": 1 },
+  "bas": {
+    // source rules (media, cover, minimum slopes) beside this file; default source_rules.json
+    "kallregler": "source_rules.json",
+
+    // water (pressure) mains
+    "vatten": {
+      "centerDepthM": 1.5,            // syncPipeNetwork polylines without slope: centreline depth below the surface
+      "tackningHjassaM": [1.2, 1.35], // verifyDrawing: the least value is the minimum cover to the crown when the source rules have none
+      "maxBojGrader": 45,             // splitBends maxDeg, tracePipeChain/applyChainProfile maxBendDeg, verifyDrawing maxBend
+      "rakMellanBojarM": 0.8,         // splitBends straightBetween
+      "stamRak": true               // resolveCrossings: the water main is never changed unless allowWaterMain: true
+    },
+
+    // gravity networks
+    "sjalvfall": {
+      "standardPromille": 5,        // gradeGravityNetwork defaultPermille
+      "fallRakBrunnM": 0.01,        // drop through a structure on a straight run (gradeGravityNetwork, syncPipeNetwork outlets)
+      "fallBojBrunnM": 0.03,        // drop through a structure at a bend
+      "hjassaMotHjassa": true       // crownToCrown: pipes of different sizes meet crown to crown
+    },
+
+    // service connections (addServiceConnection)
+    "servis": {
+      "partName": "PP 160",         // service pipe part name in your parts list
+      "diameterMm": 160,
+      "slopePermille": 10,
+      "invertRule": "centered",
+      "spolbrunn": {                // the clean-out at the end of a service
+        "partName": "Clean-out 200",
+        "diameterMm": 200
+      },
+      "vServis": {                  // kind: "water": the pressure service and its valve
+        "partName": "PE pressure pipe",
+        "diameterMm": 63,
+        "slopePermille": 0,
+        "ventilPartName": "Valve"
+      }
+    },
+
+    // gullies (addServiceConnection kind: "gully", syncPipeNetwork structure sizes)
+    "rannstensbrunn": {
+      "partName": "Gully 400",
+      "diameterMm": 400,
+      "sumpDepthM": 0.3,
+      "endBelowRimM": 1.2,
+      "servisDiameterMm": 160
+    },
+
+    // crossings (networkCrossings, moveNetworkNode, offsetPipeRun, resolveCrossings, tracePipeChain, verifyDrawing)
+    "korsning": {
+      "clearanceM": 0.10,           // minClearance for any pair without a rule
+      "kneeAfterM": 0.35,           // resolveCrossings and addServiceConnection avoid: knee distance past the crossing
+      "vMotServisLosesIFalt": true, // resolveCrossings: a water main against a service is left to the field
+      "regler": [                   // pair rules: network name patterns (* wildcard), clearance in m, either: also the other way round
+        { "upper": "V*", "lower": "S*", "clearance": 0.30 },  // water (V) over wastewater (S): also the order verifyDrawing checks
+        { "upper": "*", "lower": "*", "clearance": 0.10 }
+      ]
+    },
+
+    // sheets (buildPlanProfileSheet, buildDetailSheet, placeFlags)
+    "blad": {
+      "skalaPlan": 400,             // plan scale 1:n
+      "skalaProfilVertikal": 100,   // profile vertical scale 1:n
+      "profilViewportMm": 681.0,
+      "normalLangdMm": 537.5,
+      "bandrubrikMm": 68.0,
+      "hogeraxelMm": 26.0,
+      "maxGlidningMm": 15,
+      "planProfil": { "mallLayout": "A1 Plan+Profile" },
+      "detalj": {
+        "mallLayout": "A1 Detail",
+        "marginalMm": 3,
+        "rubrikMm": 3.5,
+        "skalaTextMm": 2.5,
+        "planytaMm": [45, 22, 716, 580], // planArea [minX, minY, maxX, maxY] in paper mm (warnings only)
+        "viewportLager": "Defpoints"
+      },
+      "flagga": { "texthojdMm": 2.5 }
+    }
+  },
+  "kommuner": {
+    "NorthTown": {
+      "korsning": { "clearanceM": 0.15 }
+    },
+    "SouthTown": {
+      "servis": { "spolbrunn": { "diameterMm": 315 } }
+    }
+  }
+}

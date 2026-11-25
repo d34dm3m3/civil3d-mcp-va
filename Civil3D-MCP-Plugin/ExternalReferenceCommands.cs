@@ -166,7 +166,20 @@ public static class ExternalReferenceCommands
   /// </summary>
   public static Task<object?> AttachXrefAsync(JsonObject? parameters)
   {
-    var path = FileBoundary.ResolveLocalReadPath(PluginRuntime.GetRequiredString(parameters, "path"), ".dwg");
+    // C214 (2026-11-24): path may be a .dxf (converted to a .dwg beside it, as dxfToDwg does; convert defaults to true),
+    // and ifAttached says what to do when the file is referenced already: "error" (default, as before), "reload"
+    // (reload it, keeping the host's layer settings as xrefReload does) or "skip". The answer's status is attached,
+    // reloaded or skipped; the reference's own status is xrefStatus. Use case: 13 scripts converted, closed the DWG,
+    // looked for the reference and chose attach or reload themselves.
+    var given = FileBoundary.ResolveLocalReadPath(PluginRuntime.GetRequiredString(parameters, "path"), ".dwg", ".dxf");
+    var isDxf = string.Equals(Path.GetExtension(given), ".dxf", StringComparison.OrdinalIgnoreCase);
+    var convert = PluginRuntime.GetOptionalBool(parameters, "convert") ?? true;
+    if (isDxf && !convert)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "A .dxf cannot be referenced as it is; give convert: true (it becomes a .dwg beside it) or a .dwg. Nothing was attached.");
+    var path = isDxf ? FileBoundary.ResolveLocalExportPath(Path.ChangeExtension(given, ".dwg"), true, ".dwg") : given;
+    var ifAttached = (PluginRuntime.GetOptionalString(parameters, "ifAttached") ?? "error").Trim().ToLowerInvariant();
+    if (ifAttached is not ("error" or "reload" or "skip"))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"ifAttached must be error, reload or skip, not '{ifAttached}'. Nothing was attached.");
     var name = (PluginRuntime.GetOptionalString(parameters, "name") ?? Path.GetFileNameWithoutExtension(path)).Trim();
     var overlay = PluginRuntime.GetOptionalBool(parameters, "overlay") ?? true;
     var x = PluginRuntime.GetOptionalDouble(parameters, "x") ?? 0;
@@ -192,6 +205,8 @@ public static class ExternalReferenceCommands
       // Need: names and existing references read through an open/close transaction, so the block table is closed
       // again before AttachXref/OverlayXref change it. The same file is looked for before the name, so attaching it
       // again under its default name says it is referenced already.
+      ObjectId attachedId = ObjectId.Null;
+      string? attachedName = null;
       using (var check = database.TransactionManager.StartOpenCloseTransaction())
       {
         var table = (BlockTable)check.GetObject(database.BlockTableId, OpenMode.ForRead);
@@ -199,11 +214,55 @@ public static class ExternalReferenceCommands
         {
           var record = (BlockTableRecord)check.GetObject(id, OpenMode.ForRead);
           if ((record.IsFromExternalReference || record.IsFromOverlayReference) && ResolveFrom(record.PathName, folder) is { } existing && SamePath(existing, path))
-            throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"'{path}' is already referenced as '{record.Name}'. Nothing was attached.");
+          {
+            if (ifAttached == "error")
+              throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"'{path}' is already referenced as '{record.Name}' (ifAttached: reload or skip). Nothing was attached.");
+            (attachedId, attachedName) = (record.ObjectId, record.Name);
+            break;
+          }
         }
-        if (table.Has(name))
+        if (attachedId.IsNull && table.Has(name))
           throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"'{name}' is already a block or an xref in the drawing (xrefs_list); give another name. Nothing was attached.");
         check.Commit();
+      }
+
+      if (!attachedId.IsNull && ifAttached == "skip")
+        return new Dictionary<string, object?>
+        {
+          ["status"] = "skipped", ["name"] = attachedName, ["resolvedPath"] = path, ["converted"] = null,
+          ["note"] = "Already referenced; nothing was converted or reloaded (ifAttached: skip).",
+        };
+
+      Dictionary<string, object?>? converted = null;
+      if (isDxf)
+      {
+        foreach (Autodesk.AutoCAD.ApplicationServices.Document open in Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager)
+          if (DocumentCommands.PathOf(open) is { } openPath && SamePath(openPath, path))
+            throw new JsonRpcDispatchException("CIVIL3D.CONFLICT", $"'{path}' is open as a drawing; close it (documentClose) before it is converted again. Nothing was attached.");
+        converted = DocumentCommands.ConvertDxf(given, path);
+      }
+
+      if (!attachedId.IsNull)
+      {
+        var record = (BlockTableRecord)transaction.GetObject(attachedId, OpenMode.ForRead);
+        var before = record.XrefStatus;
+        var overrides = SnapshotXrefLayers(database, transaction, record.Name);
+        try
+        {
+          database.ReloadXrefs(new ObjectIdCollection { record.ObjectId });
+        }
+        catch (Autodesk.AutoCAD.Runtime.Exception ex)
+        {
+          throw new JsonRpcDispatchException("CIVIL3D.API_ERROR", $"Civil 3D could not reload '{record.Name}': {ex.ErrorStatus}.{(converted != null ? " The DXF was converted." : "")}");
+        }
+        var reloaded = (BlockTableRecord)transaction.GetObject(record.ObjectId, OpenMode.ForRead);
+        return new Dictionary<string, object?>
+        {
+          ["status"] = "reloaded", ["name"] = reloaded.Name, ["resolvedPath"] = path, ["path"] = reloaded.PathName,
+          ["xrefStatusBefore"] = StatusName(before), ["xrefStatus"] = StatusName(reloaded.XrefStatus),
+          ["layerOverridesRestored"] = RestoreXrefLayers(database, transaction, overrides),
+          ["converted"] = converted, ["contents"] = XrefContents(database, transaction, reloaded),
+        };
       }
 
       var warnings = new List<string>();
@@ -284,7 +343,10 @@ public static class ExternalReferenceCommands
         ["path"] = stored,
         ["relative"] = !string.Equals(stored, path, StringComparison.Ordinal),
         ["resolvedPath"] = path,
-        ["status"] = StatusName(definition.XrefStatus),
+        ["status"] = "attached",
+        ["xrefStatus"] = StatusName(definition.XrefStatus),
+        ["converted"] = converted,
+        ["contents"] = XrefContents(database, transaction, definition),
         ["layer"] = reference.Layer,
         ["position"] = new[] { x, y, z },
         ["scale"] = scale,
@@ -292,6 +354,32 @@ public static class ExternalReferenceCommands
         ["warnings"] = warnings,
       };
     });
+  }
+
+  /// <summary>C214: what a reference brought: its dependent layers ("Name|layer") and the number of objects in the
+  /// referenced drawing's model space (null where the reference is not loaded).</summary>
+  private static Dictionary<string, object?> XrefContents(Database database, Transaction transaction, BlockTableRecord definition)
+  {
+    var prefix = definition.Name + "|";
+    var layers = 0;
+    foreach (ObjectId id in (LayerTable)transaction.GetObject(database.LayerTableId, OpenMode.ForRead))
+      if (((LayerTableRecord)transaction.GetObject(id, OpenMode.ForRead)).Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) layers++;
+    int? objects = null;
+    try
+    {
+      var xdb = definition.GetXrefDatabase(false);
+      if (xdb != null)
+      {
+        using var t = xdb.TransactionManager.StartOpenCloseTransaction();
+        objects = ((BlockTableRecord)t.GetObject(SymbolUtilityServices.GetBlockModelSpaceId(xdb), OpenMode.ForRead)).Cast<ObjectId>().Count();
+        t.Commit();
+      }
+    }
+    catch (Autodesk.AutoCAD.Runtime.Exception)
+    {
+      // not loaded
+    }
+    return new Dictionary<string, object?> { ["layers"] = layers, ["modelSpaceObjects"] = objects };
   }
 
   /// <summary>The same file by path or, when both exist, by file identity (a short 8.3 name, a hard link).</summary>

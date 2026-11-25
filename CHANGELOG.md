@@ -1,5 +1,37 @@
 # Changelog
 
+## civil3d-mcp-va — 2026-11-25
+
+Plugin commands C209 to C241 and run approval (C230). All are listed under
+"Fork additions" in the README; `listCommands {describe: true}` gives their
+parameters and answers.
+
+- Rule profile: `getRules` reads a design rule profile (a base plus municipal
+  overrides) and its source rules; `profile: true` (or `kommun`) fills omitted
+  values of the network and sheet commands from it and the answer says what came
+  from where. The format is described in `docs/rules/rules_profile.example.json`
+  and `docs/rules/source_rules.example.json`.
+- Pipe networks: declarative `syncPipeNetwork` (polylines, inserted structures,
+  outlets, depth and slope rules), `addServiceConnection` water services, inlets,
+  several connections and pruning, `setPartLock`/`getPartLocks`,
+  `moveNetworkNode`, `offsetPipeRun`, `resolveCrossings`, `tracePipeChain`,
+  `applyChainProfile`, `listServiceConnections`.
+- Checks: `verifyDrawing` (network rules against the profile and the source
+  rules), `checkNetworkAgainstEntities`, `networkCrossings` pair rules.
+- Drawing: `drawEntities` (a rerunnable drawn state under a script id prefix),
+  script ids on every creating command, `eraseEntities` selectors, `layersImport`
+  rows, `layerStateRestore` properties, `layerStateUpdate`, `xrefAttach`,
+  `addSurfacePoints` from a file, `addProfileViewGeometry`.
+- Sheets: `buildPlanProfileSheet`, `buildDetailSheet`, `placeFlags`,
+  `addLayoutTable`, `plotLayout` for several layouts, viewport roles in
+  `listLayouts`.
+- Execution: `documentActivate` waits until the drawing is active, `batch` `save`,
+  `listCommands` `describe`.
+- Run approval: `civil3d_request_approval {scope: "run", drawing}` issues one
+  reusable token for writes against a single drawing.
+- Standalone checks `tools/sheetmath_check` and `tools/flagplacement_check` for
+  the sheet geometry and the flag placement.
+
 ## civil3d-mcp-va — 2026-11-24 (fork of v1.2.1)
 
 Fork of [Sacred-G/Civil3D-mcp](https://github.com/Sacred-G/Civil3D-mcp) with

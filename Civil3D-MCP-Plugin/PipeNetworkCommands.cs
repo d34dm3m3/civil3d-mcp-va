@@ -30,11 +30,58 @@ public static partial class PipeNetworkCommands
   public static Task<object?> GetPipeNetworkAsync(JsonObject? parameters)
   {
     var name = PluginRuntime.GetRequiredString(parameters, "name");
+    // C215 (2026-11-24): with alignment, station and offset of every structure and pipe end along it.
+    var alignmentName = PluginRuntime.GetOptionalString(parameters, "alignment");
     return CivilExecution.ReadAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var network = FindPipeNetworkByName(civilDoc, transaction, name, OpenMode.ForRead);
-      return ToPipeNetworkDetail(network, transaction);
+      var alignment = string.IsNullOrWhiteSpace(alignmentName) ? null : CivilObjectUtils.FindAlignmentByName(civilDoc, transaction, alignmentName!);
+      var detail = ToPipeNetworkDetail(network, transaction);
+      if (alignment != null) AddStations(detail, alignment);
+      return detail;
     });
+  }
+
+  /// <summary>C215: station and offset (rounded to mm) of each structure (x, y) and pipe end (startPoint, endPoint)
+  /// along the alignment; null where the point lies beyond the alignment's ends.</summary>
+  private static void AddStations(Dictionary<string, object?> detail, Alignment alignment)
+  {
+    (double? Station, double? Offset) At(double x, double y)
+    {
+      try
+      {
+        double st = 0, off = 0;
+        alignment.StationOffset(x, y, ref st, ref off);
+        return (Math.Round(st, 3), Math.Round(off, 3));
+      }
+      catch (Exception)
+      {
+        return (null, null);
+      }
+    }
+    detail["alignment"] = alignment.Name;
+    if (detail["structures"] is List<Dictionary<string, object?>> structures)
+      foreach (var s in structures)
+        if (s.TryGetValue("x", out var x) && x is double sx && s["y"] is double sy)
+          (s["station"], s["offset"]) = At(sx, sy);
+    if (detail["pipes"] is List<Dictionary<string, object?>> pipes)
+      foreach (var pipe in pipes)
+      {
+        if (pipe.TryGetValue("startPoint", out var a) && a is double[] start) (pipe["startStation"], pipe["startOffset"]) = At(start[0], start[1]);
+        if (pipe.TryGetValue("endPoint", out var b) && b is double[] end) (pipe["endStation"], pipe["endOffset"]) = At(end[0], end[1]);
+      }
+  }
+
+  /// <summary>C215: the nominal size of a pipe in mm: the leading number of its part size name (the company's catalogs name
+  /// sizes "250 ", "160 "), else the inner diameter in mm.</summary>
+  internal static (double Mm, string Source) NominalDiameterMm(Pipe pipe)
+  {
+    string? sizeName = null;
+    try { sizeName = pipe.PartSizeName; } catch (Exception) { }
+    var m = sizeName == null ? null : System.Text.RegularExpressions.Regex.Match(sizeName, @"^\s*(?:[A-Za-z]+\s*)?(\d+(?:[.,]\d+)?)");
+    if (m is { Success: true } && double.TryParse(m.Groups[1].Value.Replace(',', '.'), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var n) && n > 0)
+      return (n, "partSizeName");
+    return (Math.Round(pipe.InnerDiameterOrWidth * 1000, 1), "innerDiameter");
   }
 
   public static Task<object?> GetPipeAsync(JsonObject? parameters)
@@ -329,7 +376,53 @@ public static partial class PipeNetworkCommands
       ["crownEnd"] = Math.Round(pipe.EndPoint.Z + pipe.OuterDiameterOrWidth / 2, 4),
       ["coverStart"] = TryRound(() => pipe.CoverOfStartPoint),
       ["coverEnd"] = TryRound(() => pipe.CoverOfEndpoint),
+      // C215: nominal size (as the drawing names it) and the outer radius (wall clearances, crossings)
+      ["nominalDiameterMm"] = NominalDiameterMm(pipe).Mm,
+      ["nominalDiameterSource"] = NominalDiameterMm(pipe).Source,
+      ["outerRadius"] = Math.Round(pipe.OuterDiameterOrWidth / 2, 4),
     };
+  }
+
+  /// <summary>C215: the invert of each connected pipe at this structure, and whether the pipe leaves it (out: the
+  /// structure is at the pipe's higher end; level pipes leave from their start).</summary>
+  private static List<Dictionary<string, object?>> StructureInverts(Structure structure, Transaction transaction)
+  {
+    var list = new List<Dictionary<string, object?>>();
+    for (var i = 0; i < structure.ConnectedPipesCount; i++)
+    {
+      if (Civil3DCompatibility.GetIndexedPropertyValue(structure, "ConnectedPipe", i) is not ObjectId id || id.IsNull) continue;
+      if (transaction.GetObject(id, OpenMode.ForRead) is not Pipe pipe) continue;
+      var atStart = pipe.StartStructureId == structure.ObjectId;
+      var atEnd = pipe.EndStructureId == structure.ObjectId;
+      if (!atStart && !atEnd) continue;
+      var r = pipe.InnerDiameterOrWidth / 2;
+      double here = (atStart ? pipe.StartPoint.Z : pipe.EndPoint.Z) - r, there = (atStart ? pipe.EndPoint.Z : pipe.StartPoint.Z) - r;
+      var outgoing = here > there + 1e-4 || (Math.Abs(here - there) <= 1e-4 && atStart);
+      list.Add(new Dictionary<string, object?>
+      {
+        ["pipe"] = pipe.Name, ["end"] = atStart ? "start" : "end", ["direction"] = outgoing ? "out" : "in", ["invert"] = Math.Round(here, 4),
+        ["diameterMm"] = Math.Round(pipe.InnerDiameterOrWidth * 1000, 1), ["nominalDiameterMm"] = NominalDiameterMm(pipe).Mm,
+      });
+    }
+    return list;
+  }
+
+  /// <summary>C215: the structure's extents in plan as drawn (its style's symbol, Size in real units, C189/C202).</summary>
+  private static Dictionary<string, object?>? PlanExtents(Autodesk.AutoCAD.DatabaseServices.Entity entity)
+  {
+    try
+    {
+      var e = entity.GeometricExtents;
+      return new Dictionary<string, object?>
+      {
+        ["minX"] = Math.Round(e.MinPoint.X, 3), ["minY"] = Math.Round(e.MinPoint.Y, 3), ["maxX"] = Math.Round(e.MaxPoint.X, 3), ["maxY"] = Math.Round(e.MaxPoint.Y, 3),
+        ["width"] = Math.Round(e.MaxPoint.X - e.MinPoint.X, 3), ["depth"] = Math.Round(e.MaxPoint.Y - e.MinPoint.Y, 3),
+      };
+    }
+    catch (Exception)
+    {
+      return null;
+    }
   }
 
   private static Dictionary<string, object?> ToStructureData(Structure structure, Transaction transaction)
@@ -352,6 +445,8 @@ public static partial class PipeNetworkCommands
       ["x"] = structure.Location.X,
       ["y"] = structure.Location.Y,
       ["connectedPipes"] = connectedPipeIds.Select(objectId => ResolveObjectName(transaction, objectId) ?? objectId.Handle.ToString()).ToList(),
+      ["inverts"] = StructureInverts(structure, transaction),   // C215
+      ["planExtents"] = PlanExtents(structure),                 // C215
     };
   }
 

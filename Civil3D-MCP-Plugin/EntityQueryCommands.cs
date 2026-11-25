@@ -552,11 +552,24 @@ public static class EntityQueryCommands
   /// <summary>Erases plain AutoCAD entities (texts, multileaders, lines, polylines, circles, arcs, hatches, block
   /// references, leaders, dimensions) in model space or a layout, given by handle. All handles are checked
   /// first; one missing, refused or locked handle and nothing is erased.</summary>
+  /// <summary>Erases plain AutoCAD entities given by handle (all or nothing), or C212 (2026-11-24) chosen by script id
+  /// prefix and/or layer in model space or a named layout: {idPrefix?, layer?, layout?, allOnLayer?, dryRun?}. A layer
+  /// alone erases everything on it and needs allOnLayer: true. Chosen entities that cannot be erased (Civil objects,
+  /// locked layer) are reported under skipped. Use case: the draw, label and clean-up cycle, 30 scripts
+  /// listed their id prefix and sent the handles back.</summary>
   public static Task<object?> EraseEntitiesAsync(JsonObject? parameters)
   {
     var handles = (PluginRuntime.GetParameter(parameters, "handles") as JsonArray)?.Select(n => n?.GetValue<string>()).OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-    if (handles == null || handles.Count == 0)
-      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "handles must list at least one entity handle.");
+    var idPrefix = PluginRuntime.GetOptionalString(parameters, "idPrefix");
+    var layerName = PluginRuntime.GetOptionalString(parameters, "layer");
+    if (handles is { Count: > 0 } && (idPrefix != null || layerName != null))
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Give handles, or idPrefix and/or layer, not both. Nothing was erased.");
+    if (handles is not { Count: > 0 })
+    {
+      if (idPrefix == null && string.IsNullOrWhiteSpace(layerName))
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Give handles (at least one entity handle), idPrefix or layer. Nothing was erased.");
+      return EraseSelectedAsync(parameters, idPrefix, string.IsNullOrWhiteSpace(layerName) ? null : layerName!.Trim());
+    }
 
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
@@ -572,6 +585,59 @@ public static class EntityQueryCommands
 
       return new Dictionary<string, object?> { ["erased"] = erased, ["count"] = erased.Count };
     });
+  }
+
+  /// <summary>C212: the selector form of eraseEntities (idPrefix, layer, layout).</summary>
+  private static Task<object?> EraseSelectedAsync(JsonObject? parameters, string? idPrefix, string? layer)
+  {
+    var layoutName = PluginRuntime.GetOptionalString(parameters, "layout");
+    var allOnLayer = PluginRuntime.GetOptionalBool(parameters, "allOnLayer") ?? false;
+    var dryRun = PluginRuntime.GetOptionalBool(parameters, "dryRun") ?? false;
+    if (idPrefix == null && !allOnLayer)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"layer alone erases every entity on '{layer}'; give allOnLayer: true to mean that, or an idPrefix. Nothing was erased.");
+
+    object? Body(Autodesk.AutoCAD.ApplicationServices.Document doc, Autodesk.Civil.ApplicationServices.CivilDocument civilDoc, Database database, Transaction transaction)
+    {
+      var spaceId = string.IsNullOrWhiteSpace(layoutName) || string.Equals(layoutName, "Model", StringComparison.OrdinalIgnoreCase)
+        ? SymbolUtilityServices.GetBlockModelSpaceId(database)
+        : LayoutCommands.FindLayout(database, transaction, layoutName!).BlockTableRecordId;
+      var layers = (LayerTable)transaction.GetObject(database.LayerTableId, OpenMode.ForRead);
+      if (layer != null && !layers.Has(layer))
+        throw new JsonRpcDispatchException("CIVIL3D.OBJECT_NOT_FOUND", $"Layer '{layer}' does not exist. Nothing was erased.");
+      var space = (BlockTableRecord)transaction.GetObject(spaceId, OpenMode.ForRead);
+      var erased = new List<Dictionary<string, object?>>();
+      var skipped = new List<Dictionary<string, object?>>();
+      var first = true;
+      foreach (ObjectId id in space)
+      {
+        if (transaction.GetObject(id, OpenMode.ForRead) is not AcEntity entity) continue;
+        if (entity is Viewport && first) { first = false; continue; }   // a layout's own paper space viewport
+        if (layer != null && !string.Equals(entity.Layer, layer, StringComparison.OrdinalIgnoreCase)) continue;
+        string? scriptId = null;
+        if (idPrefix != null)
+        {
+          scriptId = ScriptIdCommands.Read(entity).Id;
+          if (scriptId == null || !scriptId.StartsWith(idPrefix, StringComparison.Ordinal)) continue;
+        }
+        var kind = ErasableKind(entity);
+        var entry = new Dictionary<string, object?> { ["handle"] = entity.Handle.ToString(), ["type"] = kind ?? entity.GetRXClass().DxfName, ["layer"] = entity.Layer, ["id"] = scriptId };
+        if (kind == null) { entry["reason"] = "not a plain AutoCAD entity"; skipped.Add(entry); continue; }
+        if (((LayerTableRecord)transaction.GetObject(layers[entity.Layer], OpenMode.ForRead)).IsLocked) { entry["reason"] = "locked layer"; skipped.Add(entry); continue; }
+        if (!dryRun)
+        {
+          entity.UpgradeOpen();
+          entity.Erase();
+        }
+        erased.Add(entry);
+      }
+      return new Dictionary<string, object?>
+      {
+        ["erased"] = erased, ["count"] = erased.Count, ["skipped"] = skipped, ["dryRun"] = dryRun,
+        ["idPrefix"] = idPrefix, ["layer"] = layer, ["layout"] = string.IsNullOrWhiteSpace(layoutName) ? "Model" : layoutName,
+      };
+    }
+
+    return dryRun ? CivilExecution.ReadAsync<object?>(Body) : CivilExecution.WriteAsync<object?>(Body);
   }
 
   /// <summary>C121: scales plain AutoCAD entities given by handle, each about its own centre (circle and arc centre,

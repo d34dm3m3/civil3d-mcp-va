@@ -12,6 +12,9 @@ MCP or HTTP caller -> schema validation -> approval policy -> host queue -> Civi
 
 - Query and inspection actions are read-only and retry-safe when their tool annotations say so.
 - Destructive or ambiguous actions require preview and a short-lived, drawing-bound approval token.
+- A run approval (civil3d_request_approval scope run, drawing) covers civil3d_invoke write and action raw calls whose
+  params.expectDrawing names that drawing, for up to 120 minutes; the plugin refuses them in another drawing. Closing or
+  creating drawings, undo/redo, startCommand, whole-object deletes and data shortcuts still need a per-call token.
 - Drawing mutations execute in the Civil 3D host under command context, document lock, and a narrow transaction.
 - The Node MCP layer plans, validates, brokers, and reports results; it does not mutate drawings directly.
 `;

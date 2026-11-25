@@ -100,7 +100,8 @@ export const INVOKE_DOMAIN_DEFINITION: DomainToolDefinition = {
     description:
       "Runs any Civil 3D plugin command by name with its parameters passed through unchanged. action list shows the commands " +
       "(name, domain, read/write; filter with domain or contains). action read runs a read command without approval; action " +
-      "write runs any command after civil3d_request_approval. Parameters are the plugin's (see the command's errors); every " +
+      "write runs any command after civil3d_request_approval (per call, or a run approval for the drawing that " +
+      "params.expectDrawing names). Parameters are the plugin's (see the command's errors); every " +
       "call may carry expectDrawing (file name or path) so it is refused when another drawing is active.",
     inputShape: {
       action: z.enum(["list", "read", "write"]),

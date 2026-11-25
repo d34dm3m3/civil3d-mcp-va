@@ -26,6 +26,10 @@ public static class BatchCommands
       throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"At most {MaxCalls} calls per batch ({list.Count} given).");
     var stopOnError = PluginRuntime.GetOptionalBool(parameters, "stopOnError") ?? true;
     var singleTransaction = PluginRuntime.GetOptionalBool(parameters, "singleTransaction") ?? false;
+    // C210 (2026-11-24): save: true saves the drawing after the calls (after the commit with singleTransaction) when no
+    // call failed, through the database as saveDrawing does inside a batch. Use case: every script ended with its own save
+    // call; the template is saved this way (a COM save of a .dwt can open a dialog).
+    var save = PluginRuntime.GetOptionalBool(parameters, "save") ?? false;
     if (singleTransaction) stopOnError = true;                 // all or nothing: stop at the first failure
     var calls = new List<(string Method, JsonObject? Params)>();
     foreach (var node in list)
@@ -34,6 +38,8 @@ public static class BatchCommands
         throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Each call must be an object with a method name. Nothing was run.");
       if (string.Equals(method, "batch", StringComparison.OrdinalIgnoreCase))
         throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "A batch cannot contain another batch. Nothing was run.");
+      if (save && method is "saveDrawing")
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "save: true saves after the calls; leave saveDrawing out of calls. Nothing was run.");
       if (singleTransaction && method is "saveDrawing" or "newDrawing" or "undoDrawing" or "redoDrawing")
         throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"{method} cannot run inside a single transaction (it would act before the batch commits). Nothing was run.");
       // C98c: the label expression collection is not opened in the transaction, so an aborted batch could not undo it.
@@ -93,7 +99,31 @@ public static class BatchCommands
         ["notRun"] = calls.Count - results.Count,
         ["durationMs"] = timer.ElapsedMilliseconds,
         ["results"] = results,
+        ["saved"] = null,
       }, commit);
-    }, singleTransaction);
+    }, singleTransaction, save ? SaveAfterAsync : null);
+
+    async Task SaveAfterAsync(object? value, bool commit)
+    {
+      if (value is not Dictionary<string, object?> answer) return;
+      if (!commit || (int)answer["failed"]! > 0 || (int)answer["notRun"]! > 0)
+      {
+        answer["saved"] = new Dictionary<string, object?> { ["saved"] = false, ["reason"] = "a call failed or was not run; the drawing was not saved" };
+        return;
+      }
+      var previousDrawing = PluginRuntime.SetRequestedDrawing(batchDrawing);
+      try
+      {
+        answer["saved"] = await CommandDispatcher.DispatchAsync("saveDrawing", null, cancellationToken);
+      }
+      catch (Exception ex) when (ex is not OperationCanceledException)
+      {
+        answer["saved"] = new Dictionary<string, object?> { ["saved"] = false, ["error"] = ex is JsonRpcDispatchException ? ex.Message : PluginRuntime.DescribeException(ex) };
+      }
+      finally
+      {
+        PluginRuntime.SetRequestedDrawing(previousDrawing);
+      }
+    }
   }
 }

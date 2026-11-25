@@ -13,6 +13,32 @@ const approvalInputShape = {
   ttlSeconds: z.number().int().min(30).max(600).optional(),
 };
 
+// C230 (F2): scope "run" issues a reusable token for one drawing (drawing, ttlMinutes); scope "call" (default) is the
+// per-call token above. The run form leaves toolName, action and parameters out.
+const requestInputShape = {
+  scope: z.enum(["call", "run"]).optional(),
+  drawing: z.string().min(1).max(260).optional(),
+  ttlMinutes: z.number().int().min(1).max(120).optional(),
+  toolName: approvalInputShape.toolName.optional(),
+  action: approvalInputShape.action.optional(),
+  parameters: approvalInputShape.parameters.optional(),
+  ttlSeconds: approvalInputShape.ttlSeconds,
+};
+
+const RunRequestSchema = z.object({
+  scope: z.literal("run"),
+  drawing: z.string().min(1).max(260),
+  ttlMinutes: z.number().int().min(1).max(120).optional(),
+}).strict();
+
+const CallRequestSchema = z.object({
+  scope: z.literal("call").optional(),
+  toolName: approvalInputShape.toolName,
+  action: approvalInputShape.action,
+  parameters: approvalInputShape.parameters,
+  ttlSeconds: approvalInputShape.ttlSeconds,
+});
+
 const PreviewResponseSchema = z.object({
   status: z.enum(["approval_required", "ready"]),
   toolName: z.string(),
@@ -24,11 +50,13 @@ const PreviewResponseSchema = z.object({
 
 const ApprovalResponseSchema = z.object({
   status: z.literal("approved"),
-  toolName: z.string(),
-  action: z.string(),
+  scope: z.enum(["call", "run"]).optional(),
+  toolName: z.string().optional(),
+  action: z.string().optional(),
+  drawing: z.string().optional(),
   approvalToken: z.string(),
   expiresAt: z.string(),
-  drawingFingerprint: z.string(),
+  drawingFingerprint: z.string().optional(),
   instruction: z.string(),
 });
 
@@ -96,7 +124,20 @@ export function registerApprovalTool(server: McpServer) {
 
   const requestHandler = async (rawArgs: JsonObject) => {
     try {
-      const args = rawArgs as {
+      if (rawArgs?.scope === "run") {
+        const run = RunRequestSchema.parse(rawArgs);
+        const receipt = approvalPolicy.requestRunApproval(run.drawing, (run.ttlMinutes ?? 30) * 60 * 1000);
+        return successResult({
+          status: "approved",
+          ...receipt,
+          instruction:
+            `Pass approvalToken on civil3d_invoke action write and on action raw calls whose params.expectDrawing is ` +
+            `'${receipt.drawing}', until expiresAt. Calls it does not cover (closing or creating drawings, undo, ` +
+            "startCommand, whole-object deletes, data shortcuts, other domain actions) still need a per-call approval.",
+        });
+      }
+
+      const args = CallRequestSchema.parse(rawArgs) as {
         toolName: string;
         action: string;
         parameters: JsonObject;
@@ -117,6 +158,7 @@ export function registerApprovalTool(server: McpServer) {
 
       return successResult({
         status: "approved",
+        scope: "call",
         toolName: args.toolName,
         action: args.action,
         ...receipt,
@@ -156,8 +198,13 @@ export function registerApprovalTool(server: McpServer) {
     "civil3d_request_approval",
     {
       title: "Request Civil 3D Approval",
-      description: "Issues a short-lived, single-use approval token for a specific destructive or ambiguous Civil 3D action in the active drawing.",
-      inputSchema: approvalInputShape,
+      description:
+        "Issues a short-lived, single-use approval token for a specific destructive or ambiguous Civil 3D action in the " +
+        "active drawing (toolName, action, parameters). With scope 'run' and drawing (file name), it issues a reusable " +
+        "run token for that drawing (ttlMinutes, default 30, at most 120) that covers civil3d_invoke write and action raw " +
+        "calls whose params.expectDrawing names the drawing; document close/new, undo, startCommand, whole-object " +
+        "deletes and data shortcuts still need a per-call token.",
+      inputSchema: requestInputShape,
       outputSchema: ApprovalResponseSchema,
       annotations: {
         title: "Request Civil 3D Approval",

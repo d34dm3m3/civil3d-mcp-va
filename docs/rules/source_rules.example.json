@@ -1,0 +1,45 @@
+// Example source rules, read beside the rule profile (bas.kallregler, default source_rules.json).
+// verifyDrawing takes cover and minimum slopes per medium from here, verifyDrawing and resolveCrossings
+// take which networks belong to which medium. Comments and trailing commas are allowed.
+//
+// The keys are the file format the plugin reads (Swedish, as in the rule profile). The values below are
+// illustrative, not design advice: put your own standards and their sources here.
+//
+// medier.<medium>: the medium keys the plugin knows are spill (wastewater), dag (stormwater), dran
+// (drainage), tryckspill (pressure wastewater) and vatten (water). Gravity media (spill, dag, dran) get
+// the minimum slope check; vatten falls back to the profile's vatten.tackningHjassaM for cover.
+//   civilTyper: network name prefixes of the medium; a network belongs to the medium whose longest prefix
+//     its name starts with, followed by a non-letter or the end ("S_Main", "S-serv" = spill).
+//   minTackningM: {varde (m, null = no rule), kalla (source), styrka, anm (note shown when varde is null)}
+//   minLutningPromille: [{dimMm, promille, kalla, styrka}]: a pipe takes the row with the largest dimMm at
+//     or under its inner diameter.
+//   minLutningServisPromille: {varde, kalla, styrka}: for service networks (verifyDrawing servicePatterns).
+// styrka: "skall" (or missing) fails as an error, any other value (for example "bor") as a warning.
+{
+  "schema": { "version": 1 },
+  "medier": {
+    "spill": {
+      "civilTyper": ["S"],
+      "minTackningM": { "varde": null, "anm": "no minimum cover in the source" },
+      "minLutningPromille": [
+        { "dimMm": 160, "promille": 5.0, "kalla": "your standard, table x", "styrka": "bor" },
+        { "dimMm": 200, "promille": 4.5, "kalla": "your standard, table x", "styrka": "bor" },
+        { "dimMm": 300, "promille": 3.0, "kalla": "your standard, table x", "styrka": "bor" }
+      ],
+      "minLutningServisPromille": { "varde": 10.0, "kalla": "your standard", "styrka": "bor" }
+    },
+    "dag": {
+      "civilTyper": ["D"],
+      "minTackningM": { "varde": null, "anm": "no minimum cover in the source" },
+      "minLutningPromille": [
+        { "dimMm": 160, "promille": 4.0, "kalla": "your standard", "styrka": "bor" }
+      ]
+    },
+    "dran": { "civilTyper": ["Dr"] },
+    "tryckspill": { "civilTyper": ["TS", "LTA"] },
+    "vatten": {
+      "civilTyper": ["V"],
+      "minTackningM": { "varde": 1.35, "kalla": "your standard", "styrka": "skall" }
+    }
+  }
+}

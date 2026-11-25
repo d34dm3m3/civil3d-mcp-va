@@ -61,6 +61,15 @@ public static class LayerStandardCommands
     LayerStateMasks.CurrentViewport, LayerStateMasks.Transparency,
   };
 
+  // C217: the property names layerStateRestore takes, as layerStatesList reports a state's mask.
+  private static readonly Dictionary<string, LayerStateMasks> PropertyMasks = new(StringComparer.OrdinalIgnoreCase)
+  {
+    ["on"] = LayerStateMasks.On, ["frozen"] = LayerStateMasks.Frozen, ["locked"] = LayerStateMasks.Locked, ["plot"] = LayerStateMasks.Plot,
+    ["newViewport"] = LayerStateMasks.NewViewport, ["color"] = LayerStateMasks.Color, ["linetype"] = LayerStateMasks.LineType,
+    ["lineweight"] = LayerStateMasks.LineWeight, ["plotStyle"] = LayerStateMasks.PlotStyle, ["currentViewport"] = LayerStateMasks.CurrentViewport,
+    ["transparency"] = LayerStateMasks.Transparency,
+  };
+
   // The .NET enum has no All (ObjectARX kAll): every property flag, without LastRestored.
   private static readonly LayerStateMasks AllMasks = MaskFlags.Aggregate(LayerStateMasks.None, (all, flag) => all | flag);
 
@@ -82,7 +91,65 @@ public static class LayerStandardCommands
   /// </summary>
   public static Task<object?> ImportLayersAsync(JsonObject? parameters)
   {
+    // C213 (2026-11-24): rows [{name, color, linetype, lineweight, plot, description, locked, frozen, on, transparency}]
+    // instead of a file; the same column names as the CSV header (Swedish or English), values as in the file (booleans
+    // become ja/nej). Built into CSV text in memory and read by the same ReadLayerRows, so the checks are the file's.
+    // Use case: 23 scripts wrote a temporary CSV file only to create a few layers.
+    if (PluginRuntime.GetParameter(parameters, "rows") is JsonArray rowList)
+    {
+      if (PluginRuntime.GetOptionalString(parameters, "path") != null)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "Give path or rows, not both. Nothing was changed.");
+      return ImportLayerTextAsync(parameters, RowsToCsv(rowList), "rows", null, "rows (in memory)");
+    }
     var path = FileBoundary.ResolveImportPath(PluginRuntime.GetRequiredString(parameters, "path"), ".csv", ".txt");
+    var fileText = DecodeText(ReadFile(path), out var fileEncoding);
+    return ImportLayerTextAsync(parameters, fileText, Path.GetFileName(path), path, fileEncoding);
+  }
+
+  /// <summary>C213: rows given as JSON objects to CSV text (semicolon, every field quoted). Keys are matched like the
+  /// CSV header (Swedish or English, without case and diacritics), so "name" in one row and "Lager" in another are the
+  /// same column; a row with two keys for one column is refused; unknown keys stay as columns and are reported as
+  /// ignored. rows[i] is row i + 2 in the answer's row numbers (the header is row 1).</summary>
+  private static string RowsToCsv(JsonArray rows)
+  {
+    if (rows.Count == 0)
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "rows must list at least one layer {name, ...}. Nothing was changed.");
+    string ColumnOf(string key) => Headers.TryGetValue(NormalizeHeader(key), out var column) ? column.ToString() : key;
+    var columns = new List<string>();
+    var cells = new List<Dictionary<string, JsonNode?>>();
+    foreach (var (node, i) in rows.Select((n, i) => (n, i)))
+    {
+      if (node is not JsonObject o)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"rows[{i}] must be an object {{name, color, ...}}. Nothing was changed.");
+      var row = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
+      foreach (var (key, value) in o)
+      {
+        var column = ColumnOf(key);
+        if (!row.TryAdd(column, value))
+          throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"rows[{i}] gives {column} twice ('{key}'). Nothing was changed.");
+        if (!columns.Contains(column, StringComparer.OrdinalIgnoreCase)) columns.Add(column);
+      }
+      cells.Add(row);
+    }
+    static string Field(string text) => "\"" + text.Replace("\"", "\"\"") + "\"";
+    static string Cell(JsonNode? value) => value switch
+    {
+      null => "",
+      JsonValue v when v.TryGetValue<bool>(out var b) => b ? "ja" : "nej",
+      JsonValue v when v.TryGetValue<string>(out var t) => t,
+      JsonValue v when v.TryGetValue<double>(out var d) => d.ToString("0.###", CultureInfo.InvariantCulture),
+      var other => other.ToJsonString(),
+    };
+    var text = new StringBuilder();
+    text.Append(string.Join(";", columns.Select(Field))).Append('\n');
+    foreach (var row in cells)
+      text.Append(string.Join(";", columns.Select(c => Field(Cell(row.TryGetValue(c, out var v) ? v : null))))).Append('\n');
+    return text.ToString();
+  }
+
+  private static Task<object?> ImportLayerTextAsync(JsonObject? parameters, string text, string fileLabel, string? filePath, string encoding)
+  {
+    var path = filePath ?? fileLabel;
     var create = PluginRuntime.GetOptionalBool(parameters, "create") ?? true;
     var update = PluginRuntime.GetOptionalBool(parameters, "update") ?? true;
     var dryRun = PluginRuntime.GetOptionalBool(parameters, "dryRun") ?? false;
@@ -90,10 +157,9 @@ public static class LayerStandardCommands
     if (!create && !update && !dryRun)
       throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
         "create and update are both false, so nothing would change; use dryRun to only check the file. Nothing was changed.");
-    var text = DecodeText(ReadFile(path), out var encoding);
-    var csv = ReadLayerRows(text, Path.GetFileName(path));
+    var csv = ReadLayerRows(text, fileLabel);
     if (csv.DataRows == 0)
-      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"{Path.GetFileName(path)} has no layer rows under the header. Nothing was changed.");
+      throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", $"{fileLabel} has no layer rows under the header. Nothing was changed.");
 
     object? Body(Autodesk.AutoCAD.ApplicationServices.Document doc, Autodesk.Civil.ApplicationServices.CivilDocument civilDoc, Database database, Transaction transaction)
     {
@@ -1157,6 +1223,21 @@ public static class LayerStandardCommands
   {
     var name = PluginRuntime.GetRequiredString(parameters, "name").Trim();
     var viewportHandle = PluginRuntime.GetOptionalString(parameters, "viewport")?.Trim();
+    // C217 (2026-11-24): properties ["on", "frozen", ...] restores only those (RestoreLayerState's mask); default every
+    // property the state holds. Use case: a drafting rule that a layer state must not restore colours (the grey outgoing
+    // lines); three project scripts saved and put back the colours around every restore.
+    var properties = (PluginRuntime.GetParameter(parameters, "properties") as JsonArray)?.Select(n => n?.GetValue<string>()?.Trim() ?? "").ToList();
+    var mask = AllMasks;
+    if (properties != null)
+    {
+      var unknown = properties.Where(n => !PropertyMasks.ContainsKey(n)).ToList();
+      if (properties.Count == 0 || unknown.Count > 0)
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT",
+          $"properties must list one or more of {string.Join(", ", PropertyMasks.Keys)}{(unknown.Count > 0 ? $" (unknown: {string.Join(", ", unknown)})" : "")}. Nothing was changed.");
+      mask = properties.Aggregate(LayerStateMasks.None, (all, n) => all | PropertyMasks[n]);
+      if (!string.IsNullOrEmpty(viewportHandle))
+        throw new JsonRpcDispatchException("CIVIL3D.INVALID_INPUT", "properties does not apply with viewport (a viewport only takes the state's on/off and freeze as VP freeze). Nothing was changed.");
+    }
     return CivilExecution.WriteAsync<object?>((doc, civilDoc, database, transaction) =>
     {
       var manager = database.LayerStateManager;
@@ -1167,10 +1248,11 @@ public static class LayerStandardCommands
         return RestoreIntoViewport(database, transaction, manager, name, FindViewportId(database, transaction, viewportHandle), viewportHandle);
 
       // 0 = layers not in the state are left alone (AutoCAD's default; 1 would turn them off, 2 freeze them).
-      manager.RestoreLayerState(name, ObjectId.Null, 0, AllMasks);
+      manager.RestoreLayerState(name, ObjectId.Null, 0, mask);
       return new Dictionary<string, object?>
       {
         ["restored"] = DescribeState(manager, name, false),
+        ["properties"] = properties == null ? "all" : properties,
         ["viewport"] = null,
         ["lastRestored"] = manager.LastRestoredLayerState,
         ["note"] = "REGEN may be needed before the view updates.",
